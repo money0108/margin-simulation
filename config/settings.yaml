@@ -3,7 +3,12 @@
 # 版本: v1.0.0
 # =============================================================================
 
-# 資料路徑設定
+# Google Drive 雲端數據（用於 Streamlit Cloud 部署）
+google_drive:
+  stock_prices: "1JzGGbvFoSmN9JT2QcRWhT9SXkcWBaoFf"
+  symbols_summary: "1ozU6iyifV5N7iRGBv7koIHfpooCdzEXC"
+
+# 資料路徑設定（本地開發用）
 paths:
   # 股價歷史數據
   stock_prices: "P:/Claude Example2/遠期_新/Data/stock_price_last2y.csv"

@@ -1,6 +1,6 @@
 # =============================================================================
 # 遠期契約保證金模擬平台 - 資料載入模組
-# 功能：CSV/XLSX/MD 載入與驗證、快取機制、缺值處理
+# 功能：CSV/XLSX/MD 載入與驗證、快取機制、缺值處理、雲端下載
 # =============================================================================
 
 import os
@@ -12,8 +12,51 @@ from typing import Dict, Optional, Union, List, Tuple, Any
 from dataclasses import dataclass, field
 from io import BytesIO
 import warnings
+import tempfile
+import requests
 
 warnings.filterwarnings('ignore')
+
+
+def download_from_google_drive(file_id: str, destination: str) -> bool:
+    """
+    從 Google Drive 下載檔案
+
+    Args:
+        file_id: Google Drive 文件 ID
+        destination: 目標檔案路徑
+
+    Returns:
+        是否下載成功
+    """
+    URL = "https://drive.google.com/uc?export=download"
+
+    session = requests.Session()
+
+    # 第一次請求獲取確認 token
+    response = session.get(URL, params={'id': file_id}, stream=True)
+
+    # 檢查是否需要確認（大文件會有病毒掃描警告）
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            token = value
+            break
+
+    if token:
+        params = {'id': file_id, 'confirm': token}
+        response = session.get(URL, params=params, stream=True)
+
+    # 寫入檔案
+    try:
+        with open(destination, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=32768):
+                if chunk:
+                    f.write(chunk)
+        return True
+    except Exception as e:
+        print(f"下載失敗: {e}")
+        return False
 
 
 @dataclass
@@ -109,6 +152,54 @@ class DataLoader:
     # 股價資料載入
     # =========================================================================
 
+    def _get_cloud_data_path(self, data_type: str) -> str:
+        """
+        取得雲端數據的本地快取路徑
+
+        Args:
+            data_type: 數據類型（stock_prices, symbols_summary 等）
+
+        Returns:
+            本地快取檔案路徑
+        """
+        cache_dir = Path(tempfile.gettempdir()) / "margin_simulation_data"
+        cache_dir.mkdir(exist_ok=True)
+
+        filenames = {
+            'stock_prices': 'stock_price_last2y.csv',
+            'symbols_summary': 'symbols_summary.csv',
+        }
+        return str(cache_dir / filenames.get(data_type, f'{data_type}.csv'))
+
+    def _download_cloud_data(self, data_type: str) -> Optional[str]:
+        """
+        從 Google Drive 下載數據
+
+        Args:
+            data_type: 數據類型
+
+        Returns:
+            下載後的本地路徑，失敗返回 None
+        """
+        google_drive_config = self.config.get('google_drive', {})
+        file_id = google_drive_config.get(data_type)
+
+        if not file_id:
+            return None
+
+        local_path = self._get_cloud_data_path(data_type)
+
+        # 檢查是否已經下載過
+        if Path(local_path).exists():
+            return local_path
+
+        print(f"正在從雲端下載 {data_type}...")
+        if download_from_google_drive(file_id, local_path):
+            print(f"下載完成: {local_path}")
+            return local_path
+        else:
+            return None
+
     def load_prices(self,
                    path: Optional[str] = None,
                    use_cache: bool = True) -> pd.DataFrame:
@@ -128,7 +219,12 @@ class DataLoader:
         # 路徑驗證
         is_valid, error_msg = self._validate_path(path)
         if not is_valid:
-            raise FileNotFoundError(error_msg)
+            # 嘗試從雲端下載
+            cloud_path = self._download_cloud_data('stock_prices')
+            if cloud_path:
+                path = cloud_path
+            else:
+                raise FileNotFoundError(error_msg)
 
         # 快取檢查
         cache_key = self._get_cache_key(path, type='prices')
