@@ -120,6 +120,27 @@ def get_trading_dates(_loader):
         return [], str(e)
 
 
+def load_prices_from_upload(uploaded_file):
+    """從上傳的文件載入股價數據"""
+    try:
+        df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+        # 標準化欄位名稱
+        col_map = {'日期': 'date', '股票代號': 'code', '收盤價': 'close'}
+        for std_name, orig_name in col_map.items():
+            if orig_name in df.columns:
+                df = df.rename(columns={orig_name: std_name})
+
+        # 日期格式轉換
+        df['date'] = pd.to_datetime(df['date'].astype(str), format='%Y%m%d', errors='coerce')
+        df['code'] = df['code'].astype(str).str.strip()
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df = df.dropna(subset=['date', 'code', 'close'])
+        df = df.sort_values(['code', 'date']).reset_index(drop=True)
+        return df, None
+    except Exception as e:
+        return None, str(e)
+
+
 def create_timeseries_chart(df: pd.DataFrame) -> go.Figure:
     """建立 IM/Equity/MM 時序圖"""
     fig = make_subplots(
@@ -743,7 +764,7 @@ def main():
     # 初始化資料載入器
     loader, error = init_data_loader()
     if error:
-        st.error(f"資料載入失敗：{error}")
+        st.error(f"資料載入器初始化失敗：{error}")
         st.stop()
 
     st.session_state.data_loader = loader
@@ -752,6 +773,45 @@ def main():
     # 側邊欄設定
     # ==========================================================================
     st.sidebar.header("⚙️ 參數設定")
+
+    # 數據來源設定
+    st.sidebar.subheader("0️⃣ 股價數據")
+
+    # 初始化 session state
+    if 'prices_df' not in st.session_state:
+        st.session_state.prices_df = None
+    if 'trading_dates' not in st.session_state:
+        st.session_state.trading_dates = []
+
+    # 嘗試從雲端載入，如果失敗則讓用戶上傳
+    trading_dates, price_error = get_trading_dates(loader)
+
+    if price_error:
+        st.sidebar.warning("雲端數據載入失敗，請上傳股價檔案")
+        price_file = st.sidebar.file_uploader(
+            "上傳股價 CSV",
+            type=['csv'],
+            help="必須包含欄位：日期、股票代號、收盤價",
+            key="price_upload"
+        )
+        if price_file is not None:
+            prices_df, err = load_prices_from_upload(price_file)
+            if err:
+                st.sidebar.error(f"解析失敗：{err}")
+            else:
+                st.session_state.prices_df = prices_df
+                st.session_state.trading_dates = sorted(prices_df['date'].unique())
+                # 將股價數據注入到 DataLoader
+                loader.set_prices_df(prices_df)
+                st.sidebar.success(f"已載入 {len(prices_df)} 筆股價數據")
+                trading_dates = st.session_state.trading_dates
+    else:
+        st.sidebar.success("✓ 股價數據已載入")
+        st.session_state.trading_dates = trading_dates
+
+    # 如果之前已經上傳過股價，確保 DataLoader 也有這份數據
+    if st.session_state.prices_df is not None:
+        loader.set_prices_df(st.session_state.prices_df)
 
     # 部位上傳
     st.sidebar.subheader("1️⃣ 部位資料")
@@ -794,12 +854,12 @@ def main():
     # 日期選擇
     st.sidebar.subheader("2️⃣ 日期設定")
 
-    trading_dates, error = get_trading_dates(loader)
-    if error:
-        st.sidebar.error(f"取得交易日失敗：{error}")
-        trading_dates = []
+    # 使用已載入的交易日
+    trading_dates = st.session_state.trading_dates
 
-    if trading_dates:
+    if len(trading_dates) == 0:
+        st.sidebar.info("請先載入股價數據")
+    elif trading_dates:
         # 預設建倉日：最近 60 個交易日前
         default_start_idx = max(0, len(trading_dates) - 60)
         default_end_idx = len(trading_dates) - 1

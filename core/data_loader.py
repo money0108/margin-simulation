@@ -138,6 +138,9 @@ class DataLoader:
         self._cache: Dict[str, Any] = {}
         self._cache_timestamps: Dict[str, float] = {}
 
+        # 外部注入的數據（用於雲端部署時用戶上傳）
+        self._injected_prices: Optional[pd.DataFrame] = None
+
         # 載入設定
         if config_path is None:
             config_path = Path(__file__).parent.parent / "config" / "settings.yaml"
@@ -145,6 +148,21 @@ class DataLoader:
 
         # 缺值處理報告
         self.missing_data_report: Dict[str, Dict] = {}
+
+    def set_prices_df(self, prices_df: pd.DataFrame):
+        """
+        設定外部注入的股價數據（用於雲端部署時用戶上傳）
+
+        Args:
+            prices_df: 股價 DataFrame，必須包含 date, code, close 欄位
+        """
+        self._injected_prices = prices_df
+        # 清除股價相關的快取
+        keys_to_remove = [k for k in self._cache.keys() if 'prices' in k]
+        for k in keys_to_remove:
+            del self._cache[k]
+            if k in self._cache_timestamps:
+                del self._cache_timestamps[k]
 
     def _load_config(self, config_path: Union[str, Path]) -> Dict:
         """載入設定檔"""
@@ -283,6 +301,10 @@ class DataLoader:
         Returns:
             DataFrame，必含欄位: date, code, close
         """
+        # 如果有外部注入的股價數據，直接使用
+        if self._injected_prices is not None:
+            return self._injected_prices.copy()
+
         if path is None:
             path = self.config['paths']['stock_prices']
 
