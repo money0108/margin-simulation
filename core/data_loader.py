@@ -41,7 +41,7 @@ def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = 
         if is_sheet:
             # Google Sheets 用匯出連結
             URL = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
-            response = requests.get(URL, stream=True)
+            response = requests.get(URL, stream=True, timeout=120)
             with open(destination, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=32768):
                     if chunk:
@@ -50,23 +50,38 @@ def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = 
         else:
             # Google Drive 大文件使用 gdown
             if HAS_GDOWN:
-                url = f"https://drive.google.com/uc?id={file_id}"
-                gdown.download(url, destination, quiet=False, fuzzy=True)
+                # 使用 gdown 的 id 參數直接下載
+                try:
+                    gdown.download(id=file_id, output=destination, quiet=False)
+                except TypeError:
+                    # 舊版 gdown 不支援 id 參數
+                    url = f"https://drive.google.com/uc?id={file_id}"
+                    gdown.download(url, destination, quiet=False)
 
                 # 驗證下載的文件是否為有效的 CSV（不是 HTML 錯誤頁面）
-                if destination.endswith('.csv'):
+                if destination.endswith('.csv') and Path(destination).exists():
                     with open(destination, 'r', encoding='utf-8', errors='ignore') as f:
                         first_line = f.readline()
-                        if '<' in first_line or 'html' in first_line.lower():
+                        if '<' in first_line or 'html' in first_line.lower() or '<!DOCTYPE' in first_line:
                             print("下載的文件是 HTML 頁面，不是 CSV")
                             Path(destination).unlink(missing_ok=True)
                             return False
-                return True
+                return Path(destination).exists()
             else:
-                # 備用方案：使用 requests（可能對大文件不穩定）
-                URL = "https://drive.google.com/uc?export=download&confirm=t"
+                # 備用方案：使用 requests
+                # 對於大文件，需要處理確認頁面
                 session = requests.Session()
-                response = session.get(URL, params={'id': file_id}, stream=True)
+
+                # 第一次請求
+                url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                response = session.get(url, stream=True, timeout=120)
+
+                # 檢查是否有確認 token
+                for key, value in response.cookies.items():
+                    if key.startswith('download_warning'):
+                        url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+                        response = session.get(url, stream=True, timeout=120)
+                        break
 
                 with open(destination, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=32768):
@@ -75,6 +90,8 @@ def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = 
                 return True
     except Exception as e:
         print(f"下載失敗: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
