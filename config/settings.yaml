@@ -7,6 +7,10 @@
 google_drive:
   stock_prices: "1JzGGbvFoSmN9JT2QcRWhT9SXkcWBaoFf"
   symbols_summary: "1ozU6iyifV5N7iRGBv7koIHfpooCdzEXC"
+  industry_classification: "15kUD3PoHK1KwXUAzFor3ZQzRhYckiBfD"
+  etf_weights: "1UBt_NrqCb2YDpppP9ElexPuJY5VMwAAj"
+  leverage_table: "1ZxRuJJ95FNpqTUOp93dn5yDVIW1UcLF9"
+  sample_positions: "1BIJsoeD7nz9btbNkGOL2i0qdyQG-90rj"
 
 # 資料路徑設定（本地開發用）
 paths:

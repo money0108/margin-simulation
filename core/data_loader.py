@@ -18,34 +18,40 @@ import requests
 warnings.filterwarnings('ignore')
 
 
-def download_from_google_drive(file_id: str, destination: str) -> bool:
+def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = False) -> bool:
     """
-    從 Google Drive 下載檔案
+    從 Google Drive 或 Google Sheets 下載檔案
 
     Args:
-        file_id: Google Drive 文件 ID
+        file_id: Google Drive/Sheets 文件 ID
         destination: 目標檔案路徑
+        is_sheet: 是否為 Google Sheets（需要用不同的下載方式）
 
     Returns:
         是否下載成功
     """
-    URL = "https://drive.google.com/uc?export=download"
+    if is_sheet:
+        # Google Sheets 用匯出連結
+        URL = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+        response = requests.get(URL, stream=True)
+    else:
+        # Google Drive 文件
+        URL = "https://drive.google.com/uc?export=download"
+        session = requests.Session()
 
-    session = requests.Session()
+        # 第一次請求獲取確認 token
+        response = session.get(URL, params={'id': file_id}, stream=True)
 
-    # 第一次請求獲取確認 token
-    response = session.get(URL, params={'id': file_id}, stream=True)
+        # 檢查是否需要確認（大文件會有病毒掃描警告）
+        token = None
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                token = value
+                break
 
-    # 檢查是否需要確認（大文件會有病毒掃描警告）
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            token = value
-            break
-
-    if token:
-        params = {'id': file_id, 'confirm': token}
-        response = session.get(URL, params=params, stream=True)
+        if token:
+            params = {'id': file_id, 'confirm': token}
+            response = session.get(URL, params=params, stream=True)
 
     # 寫入檔案
     try:
@@ -168,12 +174,16 @@ class DataLoader:
         filenames = {
             'stock_prices': 'stock_price_last2y.csv',
             'symbols_summary': 'symbols_summary.csv',
+            'industry_classification': 'industry_classification.xlsx',
+            'etf_weights': 'etf_weights.xlsx',
+            'leverage_table': 'leverage_table.xlsx',
+            'sample_positions': 'sample_positions.xlsx',
         }
         return str(cache_dir / filenames.get(data_type, f'{data_type}.csv'))
 
     def _download_cloud_data(self, data_type: str) -> Optional[str]:
         """
-        從 Google Drive 下載數據
+        從 Google Drive/Sheets 下載數據
 
         Args:
             data_type: 數據類型
@@ -193,8 +203,11 @@ class DataLoader:
         if Path(local_path).exists():
             return local_path
 
+        # 判斷是否為 Google Sheets（xlsx 檔案）
+        is_sheet = data_type in ['industry_classification', 'etf_weights', 'leverage_table', 'sample_positions']
+
         print(f"正在從雲端下載 {data_type}...")
-        if download_from_google_drive(file_id, local_path):
+        if download_from_google_drive(file_id, local_path, is_sheet=is_sheet):
             print(f"下載完成: {local_path}")
             return local_path
         else:
@@ -348,7 +361,12 @@ class DataLoader:
 
         is_valid, error_msg = self._validate_path(path)
         if not is_valid:
-            raise FileNotFoundError(error_msg)
+            # 嘗試從雲端下載
+            cloud_path = self._download_cloud_data('industry_classification')
+            if cloud_path:
+                path = cloud_path
+            else:
+                raise FileNotFoundError(error_msg)
 
         cache_key = self._get_cache_key(path, type='industry')
         if use_cache:
@@ -429,7 +447,12 @@ class DataLoader:
 
         is_valid, error_msg = self._validate_path(path)
         if not is_valid:
-            raise FileNotFoundError(error_msg)
+            # 嘗試從雲端下載
+            cloud_path = self._download_cloud_data('leverage_table')
+            if cloud_path:
+                path = cloud_path
+            else:
+                raise FileNotFoundError(error_msg)
 
         cache_key = self._get_cache_key(path, type='leverage')
         if use_cache:
@@ -491,7 +514,12 @@ class DataLoader:
 
         is_valid, error_msg = self._validate_path(path)
         if not is_valid:
-            raise FileNotFoundError(error_msg)
+            # 嘗試從雲端下載
+            cloud_path = self._download_cloud_data('etf_weights')
+            if cloud_path:
+                path = cloud_path
+            else:
+                raise FileNotFoundError(error_msg)
 
         cache_key = self._get_cache_key(path, type='etf_weights')
         if use_cache:
@@ -568,7 +596,12 @@ class DataLoader:
         if is_path:
             is_valid, error_msg = self._validate_path(xlsx_path_or_buffer)
             if not is_valid:
-                raise FileNotFoundError(error_msg)
+                # 嘗試從雲端下載
+                cloud_path = self._download_cloud_data('sample_positions')
+                if cloud_path:
+                    xlsx_path_or_buffer = cloud_path
+                else:
+                    raise FileNotFoundError(error_msg)
 
         # 載入資料
         df = pd.read_excel(xlsx_path_or_buffer)
