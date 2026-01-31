@@ -17,6 +17,13 @@ import requests
 
 warnings.filterwarnings('ignore')
 
+# 嘗試導入 gdown（用於大文件下載）
+try:
+    import gdown
+    HAS_GDOWN = True
+except ImportError:
+    HAS_GDOWN = False
+
 
 def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = False) -> bool:
     """
@@ -30,36 +37,44 @@ def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = 
     Returns:
         是否下載成功
     """
-    if is_sheet:
-        # Google Sheets 用匯出連結
-        URL = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
-        response = requests.get(URL, stream=True)
-    else:
-        # Google Drive 文件
-        URL = "https://drive.google.com/uc?export=download"
-        session = requests.Session()
-
-        # 第一次請求獲取確認 token
-        response = session.get(URL, params={'id': file_id}, stream=True)
-
-        # 檢查是否需要確認（大文件會有病毒掃描警告）
-        token = None
-        for key, value in response.cookies.items():
-            if key.startswith('download_warning'):
-                token = value
-                break
-
-        if token:
-            params = {'id': file_id, 'confirm': token}
-            response = session.get(URL, params=params, stream=True)
-
-    # 寫入檔案
     try:
-        with open(destination, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=32768):
-                if chunk:
-                    f.write(chunk)
-        return True
+        if is_sheet:
+            # Google Sheets 用匯出連結
+            URL = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+            response = requests.get(URL, stream=True)
+            with open(destination, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
+            return True
+        else:
+            # Google Drive 大文件使用 gdown
+            if HAS_GDOWN:
+                url = f"https://drive.google.com/uc?id={file_id}"
+                gdown.download(url, destination, quiet=False)
+                return True
+            else:
+                # 備用方案：使用 requests（可能對大文件不穩定）
+                URL = "https://drive.google.com/uc?export=download"
+                session = requests.Session()
+                response = session.get(URL, params={'id': file_id}, stream=True)
+
+                # 檢查是否需要確認
+                token = None
+                for key, value in response.cookies.items():
+                    if key.startswith('download_warning'):
+                        token = value
+                        break
+
+                if token:
+                    params = {'id': file_id, 'confirm': token}
+                    response = session.get(URL, params=params, stream=True)
+
+                with open(destination, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=32768):
+                        if chunk:
+                            f.write(chunk)
+                return True
     except Exception as e:
         print(f"下載失敗: {e}")
         return False
