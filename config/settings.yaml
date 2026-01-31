@@ -1,0 +1,165 @@
+# =============================================================================
+# 遠期契約保證金模擬平台 - 設定檔
+# 版本: v1.0.0
+# =============================================================================
+
+# 資料路徑設定
+paths:
+  # 股價歷史數據
+  stock_prices: "P:/Claude Example2/遠期_新/Data/stock_price_last2y.csv"
+  # 股票代號公司名稱對照
+  company_mapping: "P:/Claude Example2/遠期_新/Data/台股代號公司全名對照.csv"
+  # 產業分類
+  industry_classification: "P:/Claude Example2/遠期_新/產業對照/上市櫃個股產業分類.xlsx"
+  # 股票期貨標的與槓桿倍數
+  leverage_table: "P:/Claude Example2/遠期_新/產業對照/期貨槓桿倍數_完整表.xlsx"
+  # ETF成分股與權重
+  etf_weights: "P:/Claude Example2/遠期_新/產業對照/ETF成份股權重.xlsx"
+  # 示範部位
+  sample_positions: "P:/Claude Example2/遠期_新/模擬部位/模擬1/模擬1l部位.xlsx"
+
+# 欄位對應設定
+column_mapping:
+  # 股價檔案欄位
+  prices:
+    date: "日期"
+    code: "股票代號"
+    close: "收盤價"
+    open: "開盤價"
+    high: "最高價"
+    low: "最低價"
+    volume: "成交量"
+
+  # 產業分類欄位
+  industry:
+    code: "股票代號"
+    name: "股票名稱"
+    main_industry: "主產業分類"
+    sub_industry: "次產業分類"
+    industry_code: "產業代號"
+    industry_name: "產業名稱"
+
+  # 槓桿表欄位
+  leverage:
+    futures_name: "期貨近月"
+    underlying_code: "現貨標的"
+    leverage_ratio: "槓桿倍數"
+    margin: "原始保證金"
+    multiplier: "乘數"
+
+  # ETF權重欄位
+  etf_weights:
+    code: "代號"
+    name: "名稱"
+    weight: "成分股權重"
+
+# 槓桿倍數規則（依標的類型）
+leverage_rules:
+  # 股票期貨標的（現股屬於股票期貨標的股）
+  futures_underlying: 5.0
+  # 0050/0056成份股
+  etf_constituent: 4.0
+  # 其他股票
+  other_stock: 3.0
+  # 0050 ETF
+  etf_0050: 7.0
+  # 0056 ETF
+  etf_0056: 7.0
+  # 預設（保守口徑）
+  default: 3.0
+
+# 保證金計算參數
+margin:
+  # 維持保證金比例
+  mm_ratio: 0.70
+  # 追繳回補目標（1.0 = 100% IM_today）
+  margin_call_target: 1.0
+
+# 對沖折減規則
+reduction_rules:
+  # 同桶對沖（3M報酬差 >= 10%）
+  same_bucket_high: 0.50
+  # 同桶對沖（3M報酬差 < 10%）
+  same_bucket_low: 0.20
+  # 跨桶對沖
+  cross_bucket: 0.20
+  # ETF完全對沖
+  etf_full_hedge: 1.00
+  # 3M報酬率差門檻
+  return_threshold: 0.10
+
+# 3M報酬計算參數
+return_calculation:
+  # 3M交易日數（約63交易日）
+  lookback_days: 63
+  # 不足3M時的保守折減率
+  insufficient_data_rate: 0.20
+
+# 產業桶分類對照
+bucket_mapping:
+  # 電子相關產業
+  electronic:
+    - "電子"
+    - "半導體"
+    - "電子零組件"
+    - "電腦週邊"
+    - "光電"
+    - "通訊網路"
+    - "電子通路"
+    - "資訊服務"
+    - "電機電纜"
+    - "其他電子"
+  # 金融相關產業
+  financial:
+    - "金融"
+    - "金融保險"
+    - "銀行"
+    - "保險"
+    - "金控"
+    - "證券"
+    - "其他金融"
+  # 非金電（除電子、金融外）
+  non_electronic_financial:
+    - "傳產"
+    - "水泥"
+    - "食品"
+    - "塑膠"
+    - "紡織"
+    - "造紙"
+    - "鋼鐵"
+    - "橡膠"
+    - "汽車"
+    - "建材"
+    - "航運"
+    - "觀光"
+    - "貿易"
+    - "油電燃氣"
+    - "化工"
+    - "生技醫療"
+    - "其他"
+
+# 缺值處理策略
+missing_data:
+  # 價格缺值填補方式: forward_fill, backward_fill, interpolate
+  price_fill_method: "forward_fill"
+  # 揭露缺值處理比率閾值
+  missing_ratio_threshold: 0.05
+
+# 輸出設定
+output:
+  # 金額小數位數（0 = 四捨五入到元）
+  decimal_places: 0
+  # 幣別
+  currency: "TWD"
+  # 稽核包輸出目錄
+  audit_dir: "audit_package"
+
+# ETF 代碼設定
+etf_codes:
+  - "0050"
+  - "0056"
+  - "50"  # 部分資料可能用簡稱
+  - "56"
+
+# 張數轉股數乘數
+contract_multiplier: 1000
