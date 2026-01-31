@@ -51,24 +51,22 @@ def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = 
             # Google Drive 大文件使用 gdown
             if HAS_GDOWN:
                 url = f"https://drive.google.com/uc?id={file_id}"
-                gdown.download(url, destination, quiet=False)
+                gdown.download(url, destination, quiet=False, fuzzy=True)
+
+                # 驗證下載的文件是否為有效的 CSV（不是 HTML 錯誤頁面）
+                if destination.endswith('.csv'):
+                    with open(destination, 'r', encoding='utf-8', errors='ignore') as f:
+                        first_line = f.readline()
+                        if '<' in first_line or 'html' in first_line.lower():
+                            print("下載的文件是 HTML 頁面，不是 CSV")
+                            Path(destination).unlink(missing_ok=True)
+                            return False
                 return True
             else:
                 # 備用方案：使用 requests（可能對大文件不穩定）
-                URL = "https://drive.google.com/uc?export=download"
+                URL = "https://drive.google.com/uc?export=download&confirm=t"
                 session = requests.Session()
                 response = session.get(URL, params={'id': file_id}, stream=True)
-
-                # 檢查是否需要確認
-                token = None
-                for key, value in response.cookies.items():
-                    if key.startswith('download_warning'):
-                        token = value
-                        break
-
-                if token:
-                    params = {'id': file_id, 'confirm': token}
-                    response = session.get(URL, params=params, stream=True)
 
                 with open(destination, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=32768):
@@ -77,6 +75,19 @@ def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = 
                 return True
     except Exception as e:
         print(f"下載失敗: {e}")
+        return False
+
+
+def validate_csv_file(file_path: str) -> bool:
+    """檢查 CSV 文件是否有效（不是 HTML 錯誤頁面）"""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            first_line = f.readline()
+            # 如果第一行包含 HTML 標籤，說明下載失敗
+            if '<' in first_line or 'html' in first_line.lower() or '<!DOCTYPE' in first_line:
+                return False
+        return True
+    except:
         return False
 
 
@@ -214,15 +225,29 @@ class DataLoader:
 
         local_path = self._get_cloud_data_path(data_type)
 
-        # 檢查是否已經下載過
+        # 檢查是否已經下載過且文件有效
         if Path(local_path).exists():
-            return local_path
+            # 對於 CSV 文件，驗證是否為有效數據（不是 HTML 錯誤頁面）
+            if local_path.endswith('.csv'):
+                if validate_csv_file(local_path):
+                    return local_path
+                else:
+                    # 刪除無效的緩存文件
+                    print(f"發現無效的緩存文件，重新下載: {local_path}")
+                    Path(local_path).unlink(missing_ok=True)
+            else:
+                return local_path
 
         # 判斷是否為 Google Sheets（xlsx 檔案）
         is_sheet = data_type in ['industry_classification', 'etf_weights', 'leverage_table', 'sample_positions']
 
         print(f"正在從雲端下載 {data_type}...")
         if download_from_google_drive(file_id, local_path, is_sheet=is_sheet):
+            # 再次驗證 CSV 文件
+            if local_path.endswith('.csv') and not validate_csv_file(local_path):
+                print(f"下載的文件無效: {local_path}")
+                Path(local_path).unlink(missing_ok=True)
+                return None
             print(f"下載完成: {local_path}")
             return local_path
         else:
