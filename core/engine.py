@@ -188,21 +188,29 @@ class BacktestEngine:
             return_calculator=self.return_calculator
         )
 
+        # 預建價格字典（Phase 3 優化：O(1) 查詢取代 DataFrame filter）
+        self._prices_by_date: Dict[pd.Timestamp, Dict[str, float]] = {}
+        for dt, group in self.prices_df.groupby('date'):
+            self._prices_by_date[dt] = group.set_index('code')['close'].to_dict()
+
     def get_price_for_date(self, date: pd.Timestamp) -> Dict[str, float]:
-        """取得指定日期的價格字典"""
+        """取得指定日期的價格字典（O(1) dict 查詢）"""
         date = pd.Timestamp(date)
 
-        # 精確匹配
-        date_prices = self.prices_df[self.prices_df['date'] == date]
+        # O(1) 精確匹配
+        result = self._prices_by_date.get(date)
+        if result is not None:
+            return result
 
-        if len(date_prices) == 0:
-            # 找最近的交易日
-            prev_dates = [d for d in self.trading_dates if d <= date]
-            if prev_dates:
-                nearest_date = max(prev_dates)
-                date_prices = self.prices_df[self.prices_df['date'] == nearest_date]
+        # 找最近的交易日（fallback）
+        prev_dates = [d for d in self.trading_dates if d <= date]
+        if prev_dates:
+            nearest_date = max(prev_dates)
+            result = self._prices_by_date.get(nearest_date)
+            if result is not None:
+                return result
 
-        return date_prices.set_index('code')['close'].to_dict()
+        return {}
 
     def get_trading_dates_range(self,
                                 start_date: pd.Timestamp,
@@ -296,6 +304,11 @@ class BacktestEngine:
         long_financing = None   # 多方融資金額
         short_financing = None  # 空方融資金額
 
+        # 快取 atom 模板（Phase 2 優化：部位不變時跳過 ETF lookthrough / leverage / bucket）
+        current_templates = None
+        # Phase 4-5 優化：預建 numpy 陣列加速 calculate_fast
+        current_fast_arrays = None
+
         total_dates = len(dates)
 
         # 逐日計算
@@ -334,7 +347,8 @@ class BacktestEngine:
                         positions=current_positions,
                         prices_today=prices_today,
                         asof_date=date,
-                        equity=current_equity
+                        equity=current_equity,
+                        build_reports=False
                     )
                 except Exception as e:
                     print(f"日期 {date} 舊部位計算失敗: {e}")
@@ -386,6 +400,14 @@ class BacktestEngine:
                 base_net_mv = current_net_mv
                 base_prices = prices_today.copy()
                 fixed_mm = margin_result.im_today * 0.70
+
+                # 重建快取模板與 fast_arrays（新部位）
+                current_templates = self.margin_calculator._build_atom_templates(
+                    current_positions, prices_today
+                )
+                current_fast_arrays = self.margin_calculator._build_fast_arrays(
+                    current_templates
+                )
 
                 # --- 計算新融資金額 ---
                 new_long_financing = max(0, margin_result.long_mv - current_equity)
@@ -463,13 +485,28 @@ class BacktestEngine:
                 continue
 
             # ========== 一般日（含第一天） ==========
+            # 第一天需要報表，後續一般日不需要（加速）
+            need_reports = (initial_deposit is None)
             try:
-                margin_result = self.margin_calculator.calculate(
-                    positions=current_positions,
-                    prices_today=prices_today,
-                    asof_date=date,
-                    equity=current_equity
-                )
+                if current_templates is not None:
+                    # 快速路徑：部位未變，使用快取模板 + numpy 陣列
+                    margin_result = self.margin_calculator.calculate_fast(
+                        templates=current_templates,
+                        prices_today=prices_today,
+                        asof_date=date,
+                        equity=current_equity,
+                        build_reports=need_reports,
+                        fast_arrays=current_fast_arrays
+                    )
+                else:
+                    # 完整路徑：第一天或模板尚未建立
+                    margin_result = self.margin_calculator.calculate(
+                        positions=current_positions,
+                        prices_today=prices_today,
+                        asof_date=date,
+                        equity=current_equity,
+                        build_reports=need_reports
+                    )
             except Exception as e:
                 print(f"日期 {date} 計算失敗: {e}")
                 continue
@@ -492,6 +529,13 @@ class BacktestEngine:
                 # 初始化融資追蹤
                 long_financing = max(0, margin_result.long_mv - margin_result.im_today)
                 short_financing = margin_result.short_mv
+                # 建立快取模板與 fast_arrays（後續日使用 calculate_fast）
+                current_templates = self.margin_calculator._build_atom_templates(
+                    current_positions, prices_today
+                )
+                current_fast_arrays = self.margin_calculator._build_fast_arrays(
+                    current_templates
+                )
             else:
                 # 後續每日：Equity = 上次基準入金 + 累計損益
                 cumulative_pnl = current_net_mv - base_net_mv
@@ -506,6 +550,17 @@ class BacktestEngine:
 
             # 計算追繳金額（需補足至當日新計算的 IM）
             if margin_call:
+                # 追繳日需要報表，若先前跳過則重算
+                if not need_reports:
+                    margin_result = self.margin_calculator.calculate(
+                        positions=current_positions,
+                        prices_today=prices_today,
+                        asof_date=date,
+                        equity=current_equity,
+                        build_reports=True
+                    )
+                    current_net_mv = margin_result.long_mv - margin_result.short_mv
+
                 required_deposit = max(0, margin_result.im_today - current_equity)
 
                 # 追繳後：假設客戶補足至新 IM，重置相關變數

@@ -100,6 +100,665 @@ class MarginCalculator:
         # 產業桶分析器
         self.bucket_analyzer = BucketAnalyzer(bucket_classifier, return_calculator)
 
+    def _build_atom_templates(self,
+                              positions: pd.DataFrame,
+                              prices_today: Dict[str, float]) -> List[Dict]:
+        """
+        從部位建立可重複使用的 atom 模板（含 leverage/bucket），
+        後續只需套用當日價格即可快速算出 MV。
+
+        Args:
+            positions: 部位 DataFrame
+            prices_today: 建倉日價格（用於初次 lookthrough）
+
+        Returns:
+            list of dict，每筆含 origin, parent, code, side, qty_factor,
+            price_lookup_code, instrument, is_from_etf, weight,
+            leverage, leverage_source, bucket
+        """
+        # Step 1: ETF Look-through 拆解
+        atoms, _ = self.etf_lookthrough.lookthrough(positions, prices_today)
+
+        templates = []
+        for a in atoms:
+            # 計算 qty_factor：MV / price → 後續可用 qty_factor * new_price 算 MV
+            price = prices_today.get(a.code, 0)
+            qty_factor = a.mv / price if price > 0 else 0.0
+
+            # 槓桿
+            if a.is_from_etf:
+                lev_info = self.classifier.classify_leverage_for_etf_component(
+                    a.parent, a.code
+                )
+            else:
+                lev_info = self.classifier.classify_leverage(
+                    a.code, a.instrument
+                )
+
+            # 產業桶
+            bucket = self.bucket_classifier.classify(a.code).value
+
+            templates.append({
+                'origin': a.origin,
+                'parent': a.parent,
+                'code': a.code,
+                'side': a.side,
+                'qty_factor': qty_factor,
+                'price_lookup_code': a.code,
+                'instrument': a.instrument,
+                'is_from_etf': a.is_from_etf,
+                'weight': a.weight,
+                'leverage': lev_info.leverage,
+                'leverage_source': lev_info.source,
+                'bucket': bucket,
+            })
+
+        return templates
+
+    def _build_fast_arrays(self, templates: List[Dict]) -> Dict[str, Any]:
+        """
+        從 atom templates 預建 numpy 陣列與索引結構，
+        供 calculate_fast() 的全 numpy 路徑使用。
+
+        Args:
+            templates: _build_atom_templates() 的回傳結果
+
+        Returns:
+            dict 包含 numpy 陣列與索引
+        """
+        n = len(templates)
+        if n == 0:
+            return {}
+
+        codes = [t['code'] for t in templates]
+        qty_factors = np.array([t['qty_factor'] for t in templates], dtype=np.float64)
+        leverages = np.array([t['leverage'] for t in templates], dtype=np.float64)
+        is_from_etf = np.array([t['is_from_etf'] for t in templates], dtype=bool)
+        weights = np.array([t['weight'] for t in templates], dtype=np.float64)
+
+        sides = [t['side'] for t in templates]
+        long_mask = np.array([s == 'LONG' for s in sides], dtype=bool)
+        short_mask = ~long_mask
+
+        # bucket masks
+        bucket_values = [t['bucket'] for t in templates]
+        bucket_masks: Dict[Bucket, np.ndarray] = {}
+        for b in Bucket:
+            bucket_masks[b] = np.array([bv == b.value for bv in bucket_values], dtype=bool)
+
+        # code_indices_by_side: side -> code -> array of indices
+        code_indices_by_side: Dict[str, Dict[str, np.ndarray]] = {'LONG': {}, 'SHORT': {}}
+        # etf_code_indices_by_side: side -> code -> array of indices (ETF atoms only)
+        etf_code_indices_by_side: Dict[str, Dict[str, np.ndarray]] = {'LONG': {}, 'SHORT': {}}
+
+        for i, t in enumerate(templates):
+            side = t['side']
+            code = t['code']
+            code_indices_by_side[side].setdefault(code, []).append(i)
+            if t['is_from_etf']:
+                etf_code_indices_by_side[side].setdefault(code, []).append(i)
+
+        # Convert lists to numpy arrays
+        for side in ('LONG', 'SHORT'):
+            for code in code_indices_by_side[side]:
+                code_indices_by_side[side][code] = np.array(code_indices_by_side[side][code], dtype=np.intp)
+            for code in etf_code_indices_by_side[side]:
+                etf_code_indices_by_side[side][code] = np.array(etf_code_indices_by_side[side][code], dtype=np.intp)
+
+        # bucket_side_code_indices: (Bucket, side) -> list of (code, indices)
+        bucket_side_code_indices: Dict[Tuple, List[Tuple[str, np.ndarray]]] = {}
+        for b in Bucket:
+            for side in ('LONG', 'SHORT'):
+                side_mask = long_mask if side == 'LONG' else short_mask
+                combined = side_mask & bucket_masks[b]
+                # group by code within this bucket+side
+                code_idx_map: Dict[str, List[int]] = {}
+                for i in np.where(combined)[0]:
+                    code_idx_map.setdefault(codes[i], []).append(i)
+                bucket_side_code_indices[(b, side)] = [
+                    (c, np.array(idxs, dtype=np.intp)) for c, idxs in code_idx_map.items()
+                ]
+
+        origins = [t['origin'] for t in templates]
+        parents = [t['parent'] for t in templates]
+        instruments = [t['instrument'] for t in templates]
+
+        return {
+            'n': n,
+            'codes': codes,
+            'qty_factors': qty_factors,
+            'leverages': leverages,
+            'is_from_etf': is_from_etf,
+            'weights': weights,
+            'long_mask': long_mask,
+            'short_mask': short_mask,
+            'bucket_masks': bucket_masks,
+            'bucket_values': bucket_values,
+            'code_indices_by_side': code_indices_by_side,
+            'etf_code_indices_by_side': etf_code_indices_by_side,
+            'bucket_side_code_indices': bucket_side_code_indices,
+            'origins': origins,
+            'parents': parents,
+            'instruments': instruments,
+            'sides': sides,
+        }
+
+    def calculate_fast(self,
+                       templates: List[Dict],
+                       prices_today: Dict[str, float],
+                       asof_date: pd.Timestamp,
+                       equity: Optional[float] = None,
+                       build_reports: bool = False,
+                       fast_arrays: Optional[Dict[str, Any]] = None) -> MarginResult:
+        """
+        使用預建模板的快速保證金計算。跳過 ETF lookthrough / leverage / bucket 步驟。
+
+        當 fast_arrays 提供時使用全 numpy 路徑（不建 DataFrame），
+        否則 fallback 到 DataFrame 路徑。
+
+        Args:
+            templates: _build_atom_templates() 的回傳結果
+            prices_today: 當日價格字典
+            asof_date: 估值日
+            equity: 權益
+            build_reports: 是否建立報表
+            fast_arrays: _build_fast_arrays() 的回傳結果（可選）
+
+        Returns:
+            MarginResult
+        """
+        if not templates:
+            return self._empty_result(asof_date, equity or 0.0)
+
+        # ---- 若無 fast_arrays 或需要報表，fallback 到 DataFrame 路徑 ----
+        if fast_arrays is None or build_reports:
+            atom_records = []
+            for t in templates:
+                price = prices_today.get(t['price_lookup_code'], 0)
+                mv = t['qty_factor'] * price
+                atom_records.append({
+                    'origin': t['origin'],
+                    'parent': t['parent'],
+                    'code': t['code'],
+                    'side': t['side'],
+                    'mv': mv,
+                    'instrument': t['instrument'],
+                    'is_from_etf': t['is_from_etf'],
+                    'weight': t['weight'],
+                    'leverage': t['leverage'],
+                    'leverage_source': t['leverage_source'],
+                    'bucket': t['bucket'],
+                })
+            atoms_df = pd.DataFrame(atom_records)
+            atoms_df['base_im'] = atoms_df['mv'] / atoms_df['leverage']
+            return self._compute_from_atoms_df(
+                atoms_df, atom_records, asof_date, equity, build_reports
+            )
+
+        # ==================================================================
+        # 全 numpy 快速路徑（Phase 4）
+        # ==================================================================
+        fa = fast_arrays
+        n = fa['n']
+        codes = fa['codes']
+        qty_factors = fa['qty_factors']
+        leverages = fa['leverages']
+        is_from_etf_arr = fa['is_from_etf']
+        weights_arr = fa['weights']
+        long_mask = fa['long_mask']
+        short_mask = fa['short_mask']
+        bucket_masks = fa['bucket_masks']
+        code_indices_by_side = fa['code_indices_by_side']
+        etf_code_indices_by_side = fa['etf_code_indices_by_side']
+        bucket_side_code_indices = fa['bucket_side_code_indices']
+
+        # Step 1: 向量化計算 MV
+        prices_arr = np.array([prices_today.get(c, 0) for c in codes], dtype=np.float64)
+        mv = qty_factors * prices_arr
+
+        # Step 2: 向量化計算 Base IM
+        base_im = mv / leverages
+
+        # Step 3: 大小邊判定（numpy mask sum 取代 groupby）
+        base_im_long = base_im[long_mask].sum()
+        base_im_short = base_im[short_mask].sum()
+
+        if base_im_long >= base_im_short:
+            big_side = 'LONG'
+            small_side = 'SHORT'
+            im_big = base_im_long
+            im_small_before = base_im_short
+        else:
+            big_side = 'SHORT'
+            small_side = 'LONG'
+            im_big = base_im_short
+            im_small_before = base_im_long
+
+        long_mv = mv[long_mask].sum()
+        short_mv = mv[short_mask].sum()
+
+        big_mask = long_mask if big_side == 'LONG' else short_mask
+        small_mask_side = short_mask if big_side == 'LONG' else long_mask
+
+        # Step 4: ETF 完全對沖 100% 減收（內聯，不建 ExplodedPosition）
+        disc100_mv = np.zeros(n, dtype=np.float64)
+        disc100_im = np.zeros(n, dtype=np.float64)
+
+        # 彙總大邊各 code 的 MV
+        big_side_code_mv: Dict[str, float] = {}
+        for code, idx in code_indices_by_side[big_side].items():
+            big_side_code_mv[code] = mv[idx].sum()
+
+        # 小邊 ETF atoms 的完全對沖
+        small_etf_indices = etf_code_indices_by_side[small_side]
+        for code, idx in small_etf_indices.items():
+            big_mv_for_code = big_side_code_mv.get(code, 0.0)
+            if big_mv_for_code <= 0:
+                continue
+            total_etf_mv = mv[idx].sum()
+            if total_etf_mv <= 0:
+                continue
+            hedged_mv = min(big_mv_for_code, total_etf_mv)
+            hedge_ratio = hedged_mv / total_etf_mv
+            disc100_mv[idx] = mv[idx] * hedge_ratio
+            disc100_im[idx] = disc100_mv[idx] / leverages[idx]
+
+        mv_after100 = np.maximum(mv - disc100_mv, 0.0)
+        base_im_after100 = mv_after100 / leverages
+
+        reduction_etf_100 = disc100_im[small_mask_side].sum()
+
+        # Step 5: 產業桶分析（內聯 bucket_analyzer.analyze + compute_reduction_rates）
+        # 5a: 彙總各桶的 MV 與 code-mv 列表（用 mv_after100 作 residual）
+        bucket_metrics_data: Dict[Bucket, Dict] = {}
+        for b in Bucket:
+            bm = bucket_masks[b]
+            b_long = bm & long_mask
+            b_short = bm & short_mask
+            mv_long_b = mv_after100[b_long].sum()
+            mv_short_b = mv_after100[b_short].sum()
+
+            # 收集 code-mv pairs for weighted return
+            long_code_mv = []
+            for code, idx in bucket_side_code_indices.get((b, 'LONG'), []):
+                code_mv_sum = mv_after100[idx].sum()
+                if code_mv_sum > 0:
+                    long_code_mv.append((code, code_mv_sum))
+
+            short_code_mv = []
+            for code, idx in bucket_side_code_indices.get((b, 'SHORT'), []):
+                code_mv_sum = mv_after100[idx].sum()
+                if code_mv_sum > 0:
+                    short_code_mv.append((code, code_mv_sum))
+
+            bucket_metrics_data[b] = {
+                'mv_long': mv_long_b,
+                'mv_short': mv_short_b,
+                'long_code_mv': long_code_mv,
+                'short_code_mv': short_code_mv,
+            }
+
+        # 5b: 計算各桶的加權報酬率與折減率
+        reduction_rates_data: Dict[Bucket, Dict] = {}
+        for b in Bucket:
+            bmd = bucket_metrics_data[b]
+            mv_long_b = bmd['mv_long']
+            mv_short_b = bmd['mv_short']
+
+            # 加權報酬
+            r_3m_long = None
+            r_3m_short = None
+            if bmd['long_code_mv']:
+                r_long, _, _ = self.return_calculator.compute_weighted_return(
+                    bmd['long_code_mv'], asof_date
+                )
+                r_3m_long = r_long
+            if bmd['short_code_mv']:
+                r_short, _, _ = self.return_calculator.compute_weighted_return(
+                    bmd['short_code_mv'], asof_date
+                )
+                r_3m_short = r_short
+
+            # 可對沖比例
+            if small_side == 'LONG':
+                small_mv_b = mv_long_b
+                big_mv_b = mv_short_b
+                r_small = r_3m_long
+                r_big = r_3m_short
+            else:
+                small_mv_b = mv_short_b
+                big_mv_b = mv_long_b
+                r_small = r_3m_short
+                r_big = r_3m_long
+
+            if small_mv_b > 0 and big_mv_b > 0:
+                eligible_hedged_ratio = min(big_mv_b, small_mv_b) / small_mv_b
+            else:
+                eligible_hedged_ratio = 0.0
+
+            # 同桶折減率
+            same_bucket_rate = 0.0
+            if mv_long_b > 0 and mv_short_b > 0:
+                if r_big is not None and r_small is not None:
+                    r_diff = r_big - r_small
+                    same_bucket_rate = 0.50 if r_diff >= 0.10 else 0.20
+                else:
+                    same_bucket_rate = 0.20
+            else:
+                same_bucket_rate = 0.0
+
+            reduction_rates_data[b] = {
+                'same_bucket_rate': same_bucket_rate,
+                'eligible_hedged_ratio': eligible_hedged_ratio,
+            }
+
+        # Step 6: 套用折減（numpy mask 賦值）
+        disc_same_im = np.zeros(n, dtype=np.float64)
+        disc_cross_im = np.zeros(n, dtype=np.float64)
+
+        for b in Bucket:
+            rr = reduction_rates_data[b]
+            if rr['same_bucket_rate'] <= 0:
+                continue
+            mask = small_mask_side & bucket_masks[b]
+            if not mask.any():
+                continue
+            effective_rate = rr['same_bucket_rate'] * rr['eligible_hedged_ratio']
+            disc_same_im[mask] = base_im_after100[mask] * effective_rate
+
+        # 跨桶折減
+        big_side_mv_by_bucket: Dict[str, float] = {}
+        for b in Bucket:
+            bmd = bucket_metrics_data[b]
+            if big_side == 'LONG':
+                big_side_mv_by_bucket[b.value] = bmd['mv_long']
+            else:
+                big_side_mv_by_bucket[b.value] = bmd['mv_short']
+        total_big_mv = sum(big_side_mv_by_bucket.values())
+
+        for b in Bucket:
+            rr = reduction_rates_data[b]
+            residual_ratio = max(0.0, 1.0 - rr['eligible_hedged_ratio'])
+            if residual_ratio <= 0:
+                continue
+            mask = small_mask_side & bucket_masks[b]
+            if not mask.any():
+                continue
+            other_bucket_mv = total_big_mv - big_side_mv_by_bucket.get(b.value, 0)
+            small_bucket_mv = mv_after100[mask].sum()
+            small_residual_mv = small_bucket_mv * residual_ratio
+            if small_residual_mv <= 0 or other_bucket_mv <= 0:
+                continue
+            cross_ratio = min(1.0, other_bucket_mv / small_residual_mv)
+            effective_cross_rate = 0.20 * cross_ratio * residual_ratio
+            disc_cross_im[mask] = base_im_after100[mask] * effective_cross_rate
+
+        # Step 7: 彙總計算 IM_today
+        reduction_same_bucket = disc_same_im[small_mask_side].sum()
+        reduction_cross_bucket = disc_cross_im[small_mask_side].sum()
+        total_reduction = reduction_etf_100 + reduction_same_bucket + reduction_cross_bucket
+
+        im_small_after = im_small_before - total_reduction
+        im_today = im_big + im_small_after
+
+        # Step 8: MM 與追繳判定
+        mm_today = self.mm_ratio * im_today
+        if equity is None:
+            equity = 0.0
+        if equity > 0:
+            margin_call = equity < mm_today
+            required_deposit = max(0, im_today - equity) if margin_call else 0.0
+        else:
+            margin_call = False
+            required_deposit = 0.0
+
+        # Step 9: 槓桿指標
+        gross_mv = long_mv + short_mv
+        base_im_total = base_im_long + base_im_short
+        gross_leverage = gross_mv / im_today if im_today > 0 else 0.0
+        raw_leverage = gross_mv / base_im_total if base_im_total > 0 else 0.0
+
+        # Step 10: 快速路徑不產報表
+        return MarginResult(
+            asof_date=asof_date, im_today=im_today, mm_today=mm_today,
+            equity=equity, margin_call=margin_call, required_deposit=required_deposit,
+            big_side=big_side, small_side=small_side,
+            long_mv=long_mv, short_mv=short_mv,
+            base_im_long=base_im_long, base_im_short=base_im_short,
+            im_big=im_big, im_small_before=im_small_before, im_small_after=im_small_after,
+            reduction_etf_100=reduction_etf_100,
+            reduction_same_bucket=reduction_same_bucket,
+            reduction_cross_bucket=reduction_cross_bucket,
+            total_reduction=total_reduction,
+            gross_leverage=gross_leverage, raw_leverage=raw_leverage,
+            summary_df=pd.DataFrame(), side_totals_df=pd.DataFrame(),
+            bucket_hedge_df=pd.DataFrame(), small_side_detail_df=pd.DataFrame(),
+            atom_detail_df=pd.DataFrame(), reduction_breakdown_df=pd.DataFrame(),
+            hedge_pairing_df=pd.DataFrame(),
+        )
+
+    def _compute_from_atoms_df(self,
+                               atoms_df: pd.DataFrame,
+                               atom_records: List[Dict],
+                               asof_date: pd.Timestamp,
+                               equity: Optional[float],
+                               build_reports: bool) -> MarginResult:
+        """
+        從已建好的 atoms_df（含 leverage/bucket/base_im）執行 Step 3 以後的計算。
+        calculate() 和 calculate_fast() 共用此方法。
+        """
+        # =====================================================================
+        # Step 3: 大小邊判定
+        # =====================================================================
+        base_im_by_side = atoms_df.groupby('side')['base_im'].sum()
+        base_im_long = base_im_by_side.get('LONG', 0.0)
+        base_im_short = base_im_by_side.get('SHORT', 0.0)
+
+        if base_im_long >= base_im_short:
+            big_side = 'LONG'
+            small_side = 'SHORT'
+            im_big = base_im_long
+            im_small_before = base_im_short
+        else:
+            big_side = 'SHORT'
+            small_side = 'LONG'
+            im_big = base_im_short
+            im_small_before = base_im_long
+
+        mv_by_side = atoms_df.groupby('side')['mv'].sum()
+        long_mv = mv_by_side.get('LONG', 0.0)
+        short_mv = mv_by_side.get('SHORT', 0.0)
+
+        # =====================================================================
+        # Step 4: ETF 完全對沖 100% 減收
+        # =====================================================================
+        hedged_amounts = self.etf_lookthrough.compute_full_hedge_amounts(
+            [ExplodedPosition(**{k: r[k] for k in ['origin', 'parent', 'code', 'side', 'mv', 'instrument', 'is_from_etf', 'weight']})
+             for r in atom_records],
+            big_side, small_side
+        )
+
+        atoms_df['disc100_mv'] = 0.0
+        atoms_df['disc100_im'] = 0.0
+
+        for code, hedged_mv in hedged_amounts.items():
+            mask = (
+                (atoms_df['side'] == small_side) &
+                (atoms_df['is_from_etf'] == True) &
+                (atoms_df['code'] == code)
+            )
+            if not mask.any():
+                continue
+            total_etf_mv = atoms_df.loc[mask, 'mv'].sum()
+            if total_etf_mv > 0:
+                hedge_ratio = min(hedged_mv, total_etf_mv) / total_etf_mv
+                atoms_df.loc[mask, 'disc100_mv'] = atoms_df.loc[mask, 'mv'] * hedge_ratio
+                atoms_df.loc[mask, 'disc100_im'] = atoms_df.loc[mask, 'disc100_mv'] / atoms_df.loc[mask, 'leverage']
+
+        atoms_df['mv_after100'] = (atoms_df['mv'] - atoms_df['disc100_mv']).clip(lower=0)
+        atoms_df['base_im_after100'] = atoms_df['mv_after100'] / atoms_df['leverage']
+
+        reduction_etf_100 = atoms_df[atoms_df['side'] == small_side]['disc100_im'].sum()
+
+        # =====================================================================
+        # Step 5: 產業桶分析與折減率計算
+        # =====================================================================
+        residual_atoms = [
+            ExplodedPosition(
+                origin=row['origin'], parent=row['parent'], code=row['code'],
+                side=row['side'], mv=row['mv_after100'], instrument=row['instrument'],
+                is_from_etf=row['is_from_etf'], weight=row['weight']
+            )
+            for row in atoms_df.to_dict('records')
+        ]
+        bucket_metrics = self.bucket_analyzer.analyze(residual_atoms, asof_date)
+        reduction_rates = self.bucket_analyzer.compute_reduction_rates(bucket_metrics, small_side)
+
+        # =====================================================================
+        # Step 6: 套用折減
+        # =====================================================================
+        atoms_df['disc_same_im'] = 0.0
+        atoms_df['disc_same_rate'] = 0.0
+        atoms_df['disc_cross_im'] = 0.0
+        atoms_df['disc_cross_rate'] = 0.0
+
+        for bucket in Bucket:
+            rate_result = reduction_rates[bucket]
+            if rate_result.same_bucket_rate <= 0:
+                continue
+            mask = (
+                (atoms_df['side'] == small_side) &
+                (atoms_df['bucket'] == bucket.value)
+            )
+            if not mask.any():
+                continue
+            effective_rate = rate_result.same_bucket_rate * rate_result.eligible_hedged_ratio
+            atoms_df.loc[mask, 'disc_same_rate'] = effective_rate
+            atoms_df.loc[mask, 'disc_same_im'] = atoms_df.loc[mask, 'base_im_after100'] * effective_rate
+
+        big_side_mv_by_bucket = atoms_df[atoms_df['side'] == big_side].groupby('bucket')['mv_after100'].sum().to_dict()
+        total_big_mv = sum(big_side_mv_by_bucket.values())
+
+        for bucket in Bucket:
+            rate_result = reduction_rates[bucket]
+            residual_ratio = max(0.0, 1.0 - rate_result.eligible_hedged_ratio)
+            if residual_ratio <= 0:
+                continue
+            mask = (
+                (atoms_df['side'] == small_side) &
+                (atoms_df['bucket'] == bucket.value)
+            )
+            if not mask.any():
+                continue
+            other_bucket_mv = total_big_mv - big_side_mv_by_bucket.get(bucket.value, 0)
+            small_bucket_mv = atoms_df.loc[mask, 'mv_after100'].sum()
+            small_residual_mv = small_bucket_mv * residual_ratio
+            if small_residual_mv <= 0 or other_bucket_mv <= 0:
+                continue
+            cross_ratio = min(1.0, other_bucket_mv / small_residual_mv)
+            effective_cross_rate = 0.20 * cross_ratio * residual_ratio
+            atoms_df.loc[mask, 'disc_cross_rate'] = effective_cross_rate
+            atoms_df.loc[mask, 'disc_cross_im'] = atoms_df.loc[mask, 'base_im_after100'] * effective_cross_rate
+
+        # =====================================================================
+        # Step 7: 彙總計算 IM_today
+        # =====================================================================
+        atoms_df['total_disc_im'] = atoms_df['disc100_im'] + atoms_df['disc_same_im'] + atoms_df['disc_cross_im']
+        atoms_df['im_after_disc'] = atoms_df['base_im'] - atoms_df['total_disc_im']
+
+        small_side_df = atoms_df[atoms_df['side'] == small_side]
+        reduction_same_bucket = small_side_df['disc_same_im'].sum()
+        reduction_cross_bucket = small_side_df['disc_cross_im'].sum()
+        total_reduction = reduction_etf_100 + reduction_same_bucket + reduction_cross_bucket
+
+        im_small_after = im_small_before - total_reduction
+        im_today = im_big + im_small_after
+
+        # =====================================================================
+        # Step 8: MM 與追繳判定
+        # =====================================================================
+        mm_today = self.mm_ratio * im_today
+        if equity is None:
+            equity = 0.0
+        if equity > 0:
+            margin_call = equity < mm_today
+            required_deposit = max(0, im_today - equity) if margin_call else 0.0
+        else:
+            margin_call = False
+            required_deposit = 0.0
+
+        # =====================================================================
+        # Step 9: 槓桿指標
+        # =====================================================================
+        gross_mv = long_mv + short_mv
+        base_im_total = base_im_long + base_im_short
+        gross_leverage = gross_mv / im_today if im_today > 0 else 0.0
+        raw_leverage = gross_mv / base_im_total if base_im_total > 0 else 0.0
+
+        # =====================================================================
+        # Step 10: 建立報表（可選）
+        # =====================================================================
+        if build_reports:
+            summary_df = pd.DataFrame([{
+                '估值日': asof_date.strftime('%Y-%m-%d'),
+                '大邊': big_side, '小邊': small_side,
+                '多方MV': round(long_mv), '空方MV': round(short_mv),
+                '多方Base_IM': round(base_im_long), '空方Base_IM': round(base_im_short),
+                'IM_big': round(im_big), 'IM_small(折減前)': round(im_small_before),
+                'ETF_100%折減': round(reduction_etf_100),
+                '同桶折減': round(reduction_same_bucket), '跨桶折減': round(reduction_cross_bucket),
+                '總折減': round(total_reduction), 'IM_small(折減後)': round(im_small_after),
+                'IM_today': round(im_today), 'MM_today(70%)': round(mm_today),
+                '權益': round(equity),
+                '追繳觸發': '是' if margin_call else '否',
+                '追繳金額': round(required_deposit),
+                'Gross槓桿': round(gross_leverage, 2), '無折減槓桿': round(raw_leverage, 2),
+            }])
+            side_totals_df = atoms_df.groupby('side').agg({
+                'mv': 'sum', 'base_im': 'sum', 'disc100_im': 'sum',
+                'disc_same_im': 'sum', 'disc_cross_im': 'sum',
+                'total_disc_im': 'sum', 'im_after_disc': 'sum'
+            }).reset_index()
+            side_totals_df.columns = ['邊', 'MV', 'Base_IM', 'ETF_100%折減', '同桶折減', '跨桶折減', '總折減', 'IM淨額']
+            bucket_hedge_df = self.bucket_analyzer.get_bucket_summary(bucket_metrics, reduction_rates)
+            small_side_detail_df = small_side_df.groupby(['code', 'bucket']).agg({
+                'mv_after100': 'sum', 'base_im_after100': 'sum', 'disc100_im': 'sum',
+                'disc_same_im': 'sum', 'disc_cross_im': 'sum', 'total_disc_im': 'sum'
+            }).reset_index()
+            small_side_detail_df.columns = ['代碼', '產業桶', 'MV', 'Base_IM', 'ETF折減', '同桶折減', '跨桶折減', '總折減']
+            reduction_breakdown_df = pd.DataFrame([
+                {'折減類型': 'ETF完全對沖(100%)', '金額': round(reduction_etf_100), '說明': 'ETF成分股與對向曝險完全對沖'},
+                {'折減類型': '同桶對沖', '金額': round(reduction_same_bucket), '說明': '同產業桶多空對沖(50%或20%)'},
+                {'折減類型': '跨桶對沖', '金額': round(reduction_cross_bucket), '說明': '不同產業桶多空對沖(20%)'},
+                {'折減類型': '合計', '金額': round(total_reduction), '說明': ''},
+            ])
+            hedge_pairing_df = self._build_hedge_pairing(atoms_df, big_side, small_side, reduction_rates)
+        else:
+            summary_df = pd.DataFrame()
+            side_totals_df = pd.DataFrame()
+            bucket_hedge_df = pd.DataFrame()
+            small_side_detail_df = pd.DataFrame()
+            reduction_breakdown_df = pd.DataFrame()
+            hedge_pairing_df = pd.DataFrame()
+
+        return MarginResult(
+            asof_date=asof_date, im_today=im_today, mm_today=mm_today,
+            equity=equity, margin_call=margin_call, required_deposit=required_deposit,
+            big_side=big_side, small_side=small_side,
+            long_mv=long_mv, short_mv=short_mv,
+            base_im_long=base_im_long, base_im_short=base_im_short,
+            im_big=im_big, im_small_before=im_small_before, im_small_after=im_small_after,
+            reduction_etf_100=reduction_etf_100,
+            reduction_same_bucket=reduction_same_bucket,
+            reduction_cross_bucket=reduction_cross_bucket,
+            total_reduction=total_reduction,
+            gross_leverage=gross_leverage, raw_leverage=raw_leverage,
+            summary_df=summary_df, side_totals_df=side_totals_df,
+            bucket_hedge_df=bucket_hedge_df, small_side_detail_df=small_side_detail_df,
+            atom_detail_df=atoms_df, reduction_breakdown_df=reduction_breakdown_df,
+            hedge_pairing_df=hedge_pairing_df,
+        )
+
     def _build_hedge_pairing(self,
                              atoms_df: pd.DataFrame,
                              big_side: str,
@@ -217,7 +876,8 @@ class MarginCalculator:
                  positions: pd.DataFrame,
                  prices_today: Dict[str, float],
                  asof_date: pd.Timestamp,
-                 equity: Optional[float] = None) -> MarginResult:
+                 equity: Optional[float] = None,
+                 build_reports: bool = True) -> MarginResult:
         """
         執行完整保證金計算
 
@@ -281,300 +941,9 @@ class MarginCalculator:
         # 向量化計算 Base IM
         atoms_df['base_im'] = atoms_df['mv'] / atoms_df['leverage']
 
-        # =====================================================================
-        # Step 3: 大小邊判定
-        # 制度條款 3.2：以分邊 Base IM 判定
-        # =====================================================================
-        base_im_by_side = atoms_df.groupby('side')['base_im'].sum()
-        base_im_long = base_im_by_side.get('LONG', 0.0)
-        base_im_short = base_im_by_side.get('SHORT', 0.0)
-
-        # 制度條款 3.2：大小邊判定
-        if base_im_long >= base_im_short:
-            big_side = 'LONG'
-            small_side = 'SHORT'
-            im_big = base_im_long
-            im_small_before = base_im_short
-        else:
-            big_side = 'SHORT'
-            small_side = 'LONG'
-            im_big = base_im_short
-            im_small_before = base_im_long
-
-        # MV 彙總
-        mv_by_side = atoms_df.groupby('side')['mv'].sum()
-        long_mv = mv_by_side.get('LONG', 0.0)
-        short_mv = mv_by_side.get('SHORT', 0.0)
-
-        # =====================================================================
-        # Step 4: ETF 完全對沖 100% 減收
-        # 制度條款 5.2：MV_hedged_i = min(MV_long_i, MV_short_i)
-        # =====================================================================
-        # 計算完全對沖金額
-        hedged_amounts = self.etf_lookthrough.compute_full_hedge_amounts(
-            [ExplodedPosition(**{k: r[k] for k in ['origin', 'parent', 'code', 'side', 'mv', 'instrument', 'is_from_etf', 'weight']})
-             for r in atom_records],
-            big_side, small_side
-        )
-
-        # 套用 100% 折減（只對小邊 ETF look-through）
-        atoms_df['disc100_mv'] = 0.0
-        atoms_df['disc100_im'] = 0.0
-
-        for code, hedged_mv in hedged_amounts.items():
-            # 找出小邊中該 code 的 ETF look-through 曝險
-            mask = (
-                (atoms_df['side'] == small_side) &
-                (atoms_df['is_from_etf'] == True) &
-                (atoms_df['code'] == code)
-            )
-            if not mask.any():
-                continue
-
-            # 計算對沖比例
-            total_etf_mv = atoms_df.loc[mask, 'mv'].sum()
-            if total_etf_mv > 0:
-                hedge_ratio = min(hedged_mv, total_etf_mv) / total_etf_mv
-                atoms_df.loc[mask, 'disc100_mv'] = atoms_df.loc[mask, 'mv'] * hedge_ratio
-                atoms_df.loc[mask, 'disc100_im'] = atoms_df.loc[mask, 'disc100_mv'] / atoms_df.loc[mask, 'leverage']
-
-        # 計算 100% 折減後的殘餘
-        atoms_df['mv_after100'] = (atoms_df['mv'] - atoms_df['disc100_mv']).clip(lower=0)
-        atoms_df['base_im_after100'] = atoms_df['mv_after100'] / atoms_df['leverage']
-
-        reduction_etf_100 = atoms_df[atoms_df['side'] == small_side]['disc100_im'].sum()
-
-        # =====================================================================
-        # Step 5: 產業桶分析與折減率計算
-        # 制度條款 4.3/4.4：同桶 50%/20%、跨桶 20%
-        # =====================================================================
-        # 快速建立殘餘 atoms 列表（使用 to_dict 代替 iterrows）
-        residual_atoms = [
-            ExplodedPosition(
-                origin=row['origin'],
-                parent=row['parent'],
-                code=row['code'],
-                side=row['side'],
-                mv=row['mv_after100'],
-                instrument=row['instrument'],
-                is_from_etf=row['is_from_etf'],
-                weight=row['weight']
-            )
-            for row in atoms_df.to_dict('records')
-        ]
-
-        # 分析各桶指標
-        bucket_metrics = self.bucket_analyzer.analyze(residual_atoms, asof_date)
-
-        # 計算折減率
-        reduction_rates = self.bucket_analyzer.compute_reduction_rates(
-            bucket_metrics, small_side
-        )
-
-        # =====================================================================
-        # Step 6: 套用折減（只對小邊）
-        # 制度條款 4.5：折減只作用於小邊
-        # =====================================================================
-        atoms_df['disc_same_im'] = 0.0
-        atoms_df['disc_same_rate'] = 0.0
-        atoms_df['disc_cross_im'] = 0.0
-        atoms_df['disc_cross_rate'] = 0.0
-
-        # 同桶折減
-        for bucket in Bucket:
-            rate_result = reduction_rates[bucket]
-            if rate_result.same_bucket_rate <= 0:
-                continue
-
-            # 可對沖比例內的部分給予同桶折減
-            mask = (
-                (atoms_df['side'] == small_side) &
-                (atoms_df['bucket'] == bucket.value)
-            )
-            if not mask.any():
-                continue
-
-            # 有效折減率 = 同桶折減率 × 可對沖比例
-            effective_rate = rate_result.same_bucket_rate * rate_result.eligible_hedged_ratio
-            atoms_df.loc[mask, 'disc_same_rate'] = effective_rate
-            atoms_df.loc[mask, 'disc_same_im'] = atoms_df.loc[mask, 'base_im_after100'] * effective_rate
-
-        # 跨桶折減（對小邊未被同桶覆蓋的部分）
-        # 計算大邊各桶 MV
-        big_side_mv_by_bucket = atoms_df[atoms_df['side'] == big_side].groupby('bucket')['mv_after100'].sum().to_dict()
-        total_big_mv = sum(big_side_mv_by_bucket.values())
-
-        for bucket in Bucket:
-            rate_result = reduction_rates[bucket]
-            residual_ratio = max(0.0, 1.0 - rate_result.eligible_hedged_ratio)
-            if residual_ratio <= 0:
-                continue
-
-            mask = (
-                (atoms_df['side'] == small_side) &
-                (atoms_df['bucket'] == bucket.value)
-            )
-            if not mask.any():
-                continue
-
-            # 跨桶對沖：其他桶的大邊 MV
-            other_bucket_mv = total_big_mv - big_side_mv_by_bucket.get(bucket.value, 0)
-            small_bucket_mv = atoms_df.loc[mask, 'mv_after100'].sum()
-            small_residual_mv = small_bucket_mv * residual_ratio
-
-            if small_residual_mv <= 0 or other_bucket_mv <= 0:
-                continue
-
-            # 跨桶覆蓋比例
-            cross_ratio = min(1.0, other_bucket_mv / small_residual_mv)
-            effective_cross_rate = 0.20 * cross_ratio * residual_ratio
-
-            atoms_df.loc[mask, 'disc_cross_rate'] = effective_cross_rate
-            atoms_df.loc[mask, 'disc_cross_im'] = atoms_df.loc[mask, 'base_im_after100'] * effective_cross_rate
-
-        # =====================================================================
-        # Step 7: 彙總計算 IM_today
-        # 制度條款 4.6：IM_today = IM_big + IM_small_after
-        # =====================================================================
-        atoms_df['total_disc_im'] = atoms_df['disc100_im'] + atoms_df['disc_same_im'] + atoms_df['disc_cross_im']
-        atoms_df['im_after_disc'] = atoms_df['base_im'] - atoms_df['total_disc_im']
-
-        # 小邊折減彙總
-        small_side_df = atoms_df[atoms_df['side'] == small_side]
-        reduction_same_bucket = small_side_df['disc_same_im'].sum()
-        reduction_cross_bucket = small_side_df['disc_cross_im'].sum()
-        total_reduction = reduction_etf_100 + reduction_same_bucket + reduction_cross_bucket
-
-        im_small_after = im_small_before - total_reduction
-
-        # 制度條款 4.6：IM_today
-        im_today = im_big + im_small_after
-
-        # =====================================================================
-        # Step 8: MM 與追繳判定
-        # 制度條款 6：MM = 70% × IM_today
-        # =====================================================================
-        mm_today = self.mm_ratio * im_today
-
-        # 權益（由外部提供，若未提供則暫設為 0，由引擎後續更新）
-        if equity is None:
-            equity = 0.0
-
-        # 制度條款 6.2：追繳判定（若 equity=0 表示尚未設定，暫不判定追繳）
-        if equity > 0:
-            margin_call = equity < mm_today
-            required_deposit = max(0, im_today - equity) if margin_call else 0.0
-        else:
-            margin_call = False
-            required_deposit = 0.0
-
-        # =====================================================================
-        # Step 9: 槓桿指標
-        # =====================================================================
-        gross_mv = long_mv + short_mv
-        base_im_total = base_im_long + base_im_short  # 無折減的總 Base IM
-
-        gross_leverage = gross_mv / im_today if im_today > 0 else 0.0
-        raw_leverage = gross_mv / base_im_total if base_im_total > 0 else 0.0  # 無折減槓桿
-
-        # =====================================================================
-        # Step 10: 建立報表
-        # =====================================================================
-        # 摘要表
-        summary_df = pd.DataFrame([{
-            '估值日': asof_date.strftime('%Y-%m-%d'),
-            '大邊': big_side,
-            '小邊': small_side,
-            '多方MV': round(long_mv),
-            '空方MV': round(short_mv),
-            '多方Base_IM': round(base_im_long),
-            '空方Base_IM': round(base_im_short),
-            'IM_big': round(im_big),
-            'IM_small(折減前)': round(im_small_before),
-            'ETF_100%折減': round(reduction_etf_100),
-            '同桶折減': round(reduction_same_bucket),
-            '跨桶折減': round(reduction_cross_bucket),
-            '總折減': round(total_reduction),
-            'IM_small(折減後)': round(im_small_after),
-            'IM_today': round(im_today),
-            'MM_today(70%)': round(mm_today),
-            '權益': round(equity),
-            '追繳觸發': '是' if margin_call else '否',
-            '追繳金額': round(required_deposit),
-            'Gross槓桿': round(gross_leverage, 2),
-            '無折減槓桿': round(raw_leverage, 2),
-        }])
-
-        # 分邊彙總表
-        side_totals_df = atoms_df.groupby('side').agg({
-            'mv': 'sum',
-            'base_im': 'sum',
-            'disc100_im': 'sum',
-            'disc_same_im': 'sum',
-            'disc_cross_im': 'sum',
-            'total_disc_im': 'sum',
-            'im_after_disc': 'sum'
-        }).reset_index()
-        side_totals_df.columns = ['邊', 'MV', 'Base_IM', 'ETF_100%折減', '同桶折減', '跨桶折減', '總折減', 'IM淨額']
-
-        # 產業桶對沖表
-        bucket_hedge_df = self.bucket_analyzer.get_bucket_summary(
-            bucket_metrics, reduction_rates
-        )
-
-        # 小邊明細表
-        small_side_detail_df = small_side_df.groupby(['code', 'bucket']).agg({
-            'mv_after100': 'sum',
-            'base_im_after100': 'sum',
-            'disc100_im': 'sum',
-            'disc_same_im': 'sum',
-            'disc_cross_im': 'sum',
-            'total_disc_im': 'sum'
-        }).reset_index()
-        small_side_detail_df.columns = ['代碼', '產業桶', 'MV', 'Base_IM', 'ETF折減', '同桶折減', '跨桶折減', '總折減']
-
-        # 折減分解表
-        reduction_breakdown_df = pd.DataFrame([
-            {'折減類型': 'ETF完全對沖(100%)', '金額': round(reduction_etf_100), '說明': 'ETF成分股與對向曝險完全對沖'},
-            {'折減類型': '同桶對沖', '金額': round(reduction_same_bucket), '說明': '同產業桶多空對沖(50%或20%)'},
-            {'折減類型': '跨桶對沖', '金額': round(reduction_cross_bucket), '說明': '不同產業桶多空對沖(20%)'},
-            {'折減類型': '合計', '金額': round(total_reduction), '說明': ''},
-        ])
-
-        # =====================================================================
-        # 多空配對明細表
-        # =====================================================================
-        hedge_pairing_df = self._build_hedge_pairing(atoms_df, big_side, small_side, reduction_rates)
-
-        return MarginResult(
-            asof_date=asof_date,
-            im_today=im_today,
-            mm_today=mm_today,
-            equity=equity,
-            margin_call=margin_call,
-            required_deposit=required_deposit,
-            big_side=big_side,
-            small_side=small_side,
-            long_mv=long_mv,
-            short_mv=short_mv,
-            base_im_long=base_im_long,
-            base_im_short=base_im_short,
-            im_big=im_big,
-            im_small_before=im_small_before,
-            im_small_after=im_small_after,
-            reduction_etf_100=reduction_etf_100,
-            reduction_same_bucket=reduction_same_bucket,
-            reduction_cross_bucket=reduction_cross_bucket,
-            total_reduction=total_reduction,
-            gross_leverage=gross_leverage,
-            raw_leverage=raw_leverage,
-            summary_df=summary_df,
-            side_totals_df=side_totals_df,
-            bucket_hedge_df=bucket_hedge_df,
-            small_side_detail_df=small_side_detail_df,
-            atom_detail_df=atoms_df,
-            reduction_breakdown_df=reduction_breakdown_df,
-            hedge_pairing_df=hedge_pairing_df,
+        # Step 3 以後委派給共用方法
+        return self._compute_from_atoms_df(
+            atoms_df, atom_records, asof_date, equity, build_reports
         )
 
 
