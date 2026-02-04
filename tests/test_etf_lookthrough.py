@@ -89,7 +89,9 @@ class TestETFLookthrough:
 
         classifier = InstrumentClassifier(
             futures_underlying_set=set(),
-            constituent_set_0050_0056=set()
+            constituent_set_0050_0056=set(),
+            futures_leverage_map={},
+            etf_volume_map={'0050': 50000}  # 月均量 ≥ 10,000 張 → 7x
         )
 
         etf_lookthrough = ETFLookthrough(data['etf_weights'], classifier)
@@ -144,8 +146,10 @@ class TestETFLookthrough:
         ])
 
         classifier = InstrumentClassifier(
-            futures_underlying_set={'2330'},  # 2330 是期貨標的 → 5x
-            constituent_set_0050_0056={'2330', '2317', '2454'}
+            futures_underlying_set={'2330'},
+            constituent_set_0050_0056={'2330', '2317', '2454'},
+            futures_leverage_map={'2330': 5.0},  # 2330 股期槓桿>7 → 5x
+            etf_volume_map={'0050': 50000}  # 月均量 ≥ 10,000 張 → 7x
         )
 
         etf_lookthrough = ETFLookthrough(data['etf_weights'], classifier)
@@ -219,7 +223,9 @@ class TestETFLookthrough:
 
         classifier = InstrumentClassifier(
             futures_underlying_set={'2330'},
-            constituent_set_0050_0056={'2330', '2317', '2454'}
+            constituent_set_0050_0056={'2330', '2317', '2454'},
+            futures_leverage_map={'2330': 5.0},
+            etf_volume_map={'0050': 50000}  # 月均量 ≥ 10,000 張 → 7x
         )
 
         etf_lookthrough = ETFLookthrough(data['etf_weights'], classifier)
@@ -271,30 +277,62 @@ class TestETFLookthrough:
 
         print("test_etf_partial_hedge passed")
 
-    def test_etf_7x_leverage(self, setup_etf_test_data):
+    def test_etf_volume_based_leverage(self, setup_etf_test_data):
         """
-        測試：ETF look-through 後使用 7x 槓桿
+        測試：ETF 槓桿依月均量判定
 
-        制度條款 5.1：拆解後每一檔成份股視為「曝險單元」，
-        並以 ETF 槓桿 7x 計算其 Base IM
+        制度規則：
+        - 月均量 ≥ 10,000 張 → 7x
+        - 月均量 < 10,000 張 → 5x
+        - ETF look-through 後成分股沿用母 ETF 槓桿
         """
         data = setup_etf_test_data
 
-        classifier = InstrumentClassifier(
+        # 高月均量 → 7x
+        classifier_high = InstrumentClassifier(
             futures_underlying_set={'2330'},
-            constituent_set_0050_0056={'2330', '2317', '2454'}
+            constituent_set_0050_0056={'2330', '2317', '2454'},
+            futures_leverage_map={'2330': 5.0},
+            etf_volume_map={'0050': 50000, '0056': 20000}  # 都 ≥ 10,000 張
         )
 
-        # ETF look-through 後的槓桿判定
-        lev_info = classifier.classify_leverage_for_etf_component('0050', '2330')
+        lev_info = classifier_high.classify_leverage('0050', 'ETF')
         assert lev_info.leverage == 7.0, \
-            f"ETF 成分股應使用 7x 槓桿，實際為 {lev_info.leverage}"
+            f"0050 月均量 50,000 張應為 7x，實際為 {lev_info.leverage}"
 
-        lev_info = classifier.classify_leverage_for_etf_component('0056', '2317')
+        lev_info = classifier_high.classify_leverage_for_etf_component('0050', '2330')
         assert lev_info.leverage == 7.0, \
-            f"0056 成分股也應使用 7x 槓桿，實際為 {lev_info.leverage}"
+            f"ETF look-through 成分股應沿用 7x，實際為 {lev_info.leverage}"
 
-        print("✅ test_etf_7x_leverage 通過")
+        # 低月均量 → 5x
+        classifier_low = InstrumentClassifier(
+            futures_underlying_set={'2330'},
+            constituent_set_0050_0056={'2330', '2317', '2454'},
+            futures_leverage_map={'2330': 5.0},
+            etf_volume_map={'0050': 5000}  # < 10,000 張
+        )
+
+        lev_info = classifier_low.classify_leverage('0050', 'ETF')
+        assert lev_info.leverage == 5.0, \
+            f"0050 月均量 5,000 張應為 5x，實際為 {lev_info.leverage}"
+
+        lev_info = classifier_low.classify_leverage_for_etf_component('0050', '2330')
+        assert lev_info.leverage == 5.0, \
+            f"ETF look-through 成分股應沿用 5x，實際為 {lev_info.leverage}"
+
+        # 無月均量資料 → 預設 5x（保守處理）
+        classifier_no_vol = InstrumentClassifier(
+            futures_underlying_set={'2330'},
+            constituent_set_0050_0056={'2330', '2317', '2454'},
+            futures_leverage_map={'2330': 5.0},
+            etf_volume_map={}
+        )
+
+        lev_info = classifier_no_vol.classify_leverage('0050', 'ETF')
+        assert lev_info.leverage == 5.0, \
+            f"無月均量資料應為 5x（保守），實際為 {lev_info.leverage}"
+
+        print("✅ test_etf_volume_based_leverage 通過")
 
 
 if __name__ == '__main__':

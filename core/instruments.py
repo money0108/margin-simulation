@@ -35,17 +35,22 @@ class InstrumentClassifier:
     負責判定標的類型與對應槓桿倍數
 
     槓桿規則：
-    - 股票期貨標的（現股屬於股票期貨標的股）：5x
-    - 0050/0056 成份股：4x
+    - ETF（月均量 ≥ 10,000 張）：7x
+    - ETF（月均量 < 10,000 張）：5x
+    - 股票期貨標的（依股期槓桿倍數動態判定）：
+        - 股期槓桿 > 7  → 5x
+        - 股期槓桿 > 6 且 ≤ 7 → 4x
+        - 股期槓桿 ≤ 6  → 3x
     - 其他股票：3x
-    - 0050 ETF：7x
-    - 0056 ETF：7x
     """
 
     def __init__(self,
                  futures_underlying_set: Set[str],
                  constituent_set_0050_0056: Set[str],
-                 leverage_config: Optional[Dict] = None):
+                 leverage_config: Optional[Dict] = None,
+                 futures_leverage_map: Optional[Dict[str, float]] = None,
+                 etf_volume_map: Optional[Dict[str, float]] = None,
+                 etf_volume_threshold: float = 10000):
         """
         初始化標的分類器
 
@@ -53,9 +58,19 @@ class InstrumentClassifier:
             futures_underlying_set: 股票期貨標的代碼集合
             constituent_set_0050_0056: 0050/0056 成分股代碼集合
             leverage_config: 槓桿設定（可選）
+            futures_leverage_map: 股期標的 → 遠期槓桿倍數動態對應表（可選）
+            etf_volume_map: ETF 代碼 → 月均量（張）（可選）
+            etf_volume_threshold: ETF 月均量門檻（張），≥ 此值為 7x，否則 5x
         """
         self.futures_underlying_set = futures_underlying_set
         self.constituent_set = constituent_set_0050_0056
+
+        # 動態槓桿對應表：code → leverage (5/4/3)
+        self.futures_leverage_map = futures_leverage_map or {}
+
+        # ETF 月均量對應表與門檻
+        self.etf_volume_map = etf_volume_map or {}
+        self.etf_volume_threshold = etf_volume_threshold
 
         # 預設槓桿設定
         self.leverage_config = leverage_config or {
@@ -70,15 +85,32 @@ class InstrumentClassifier:
         # 缺碼記錄（用於稽核）
         self.missing_codes: List[str] = []
 
+    def _get_etf_leverage(self, code: str) -> float:
+        """
+        依 ETF 月均量判定槓桿倍數
+
+        規則：月均量 ≥ etf_volume_threshold（預設 10,000 張）→ 7x，否則 5x
+        若無月均量資料，預設 5x（保守處理）
+        """
+        norm_code = code
+        if code == '50':
+            norm_code = '0050'
+        elif code == '56':
+            norm_code = '0056'
+
+        vol = self.etf_volume_map.get(norm_code) or self.etf_volume_map.get(code)
+        if vol is not None and vol >= self.etf_volume_threshold:
+            return 7.0
+        return 5.0
+
     def classify_leverage(self, code: str, instrument: str) -> LeverageInfo:
         """
         依標的類型判定槓桿倍數
 
         制度規則（依優先順序）：
-        1. ETF (0050/0056) => 7x
-        2. 股票期貨標的 => 5x
-        3. 0050/0056 成份股 => 4x
-        4. 其它股票 => 3x
+        1. ETF → 月均量 ≥ 10,000 張 → 7x，否則 5x
+        2. 股票期貨標的 → 依股期槓桿倍數動態判定 (5x/4x/3x)
+        3. 其它股票 → 3x
 
         Args:
             code: 標的代碼
@@ -89,39 +121,34 @@ class InstrumentClassifier:
         """
         code = str(code).strip()
 
-        # 制度條款 2.1：ETF (0050/0056) => 7x
+        # 條款 1：ETF → 依月均量判定 7x 或 5x
         if instrument == 'ETF':
+            lev = self._get_etf_leverage(code)
+            lev_str = f'{lev:.0f}x'
             if code in {'0050', '50'}:
                 return LeverageInfo(
-                    leverage=self.leverage_config['etf_0050'],
-                    source='ETF_0050_7x'
+                    leverage=lev,
+                    source=f'ETF_0050_{lev_str}'
                 )
             if code in {'0056', '56'}:
                 return LeverageInfo(
-                    leverage=self.leverage_config['etf_0056'],
-                    source='ETF_0056_7x'
+                    leverage=lev,
+                    source=f'ETF_0056_{lev_str}'
                 )
-            # 其他 ETF 預設 3x（保守口徑）
             return LeverageInfo(
-                leverage=self.leverage_config['default'],
-                source='other_ETF_3x_conservative'
+                leverage=lev,
+                source=f'ETF_{lev_str}'
             )
 
-        # 制度條款 2.2：股票期貨標的 => 5x
-        if code in self.futures_underlying_set:
+        # 條款 2：股票期貨標的 → 依動態對應表查詢
+        if code in self.futures_leverage_map:
+            lev = self.futures_leverage_map[code]
             return LeverageInfo(
-                leverage=self.leverage_config['futures_underlying'],
-                source='futures_underlying_5x'
+                leverage=lev,
+                source=f'futures_underlying_{lev:.0f}x'
             )
 
-        # 制度條款 2.3：0050/0056 成份股 => 4x
-        if code in self.constituent_set:
-            return LeverageInfo(
-                leverage=self.leverage_config['etf_constituent'],
-                source='etf_constituent_4x'
-            )
-
-        # 制度條款 2.4：其它股票 => 3x
+        # 條款 3：其它股票 → 3x
         return LeverageInfo(
             leverage=self.leverage_config['other_stock'],
             source='other_stock_3x'
@@ -134,7 +161,8 @@ class InstrumentClassifier:
         ETF look-through 後成分股的槓桿判定
 
         制度規定：拆解後每一檔成份股視為「曝險單元」，
-        並以 ETF 槓桿 7x 計算其 Base IM
+        並以母 ETF 的槓桿倍數計算其 Base IM
+        （月均量 ≥ 10,000 張 → 7x，否則 5x）
 
         Args:
             parent_etf: 母 ETF 代碼（0050/0056）
@@ -143,22 +171,23 @@ class InstrumentClassifier:
         Returns:
             LeverageInfo
         """
-        # 制度條款 5.1：ETF look-through 後仍以 7x 計算
+        lev = self._get_etf_leverage(parent_etf)
+        lev_str = f'{lev:.0f}x'
+
         if parent_etf in {'0050', '50'}:
             return LeverageInfo(
-                leverage=self.leverage_config['etf_0050'],
-                source='ETF_0050_lookthrough_7x'
+                leverage=lev,
+                source=f'ETF_0050_lookthrough_{lev_str}'
             )
         if parent_etf in {'0056', '56'}:
             return LeverageInfo(
-                leverage=self.leverage_config['etf_0056'],
-                source='ETF_0056_lookthrough_7x'
+                leverage=lev,
+                source=f'ETF_0056_lookthrough_{lev_str}'
             )
 
-        # 非 0050/0056 的 ETF（保守處理）
         return LeverageInfo(
-            leverage=self.leverage_config['default'],
-            source='other_ETF_lookthrough_3x_conservative'
+            leverage=lev,
+            source=f'other_ETF_lookthrough_{lev_str}'
         )
 
 
@@ -170,7 +199,7 @@ class ETFLookthrough:
     制度規則：
     - 把 ETF 名目市值依成份股權重拆解為成份股曝險
     - MV_i_from_ETF = ETF_MV × weight_i
-    - 拆解後每檔成份股以 7x 槓桿計算 Base IM
+    - 拆解後每檔成份股以母 ETF 槓桿計算 Base IM（月均量≥10,000張→7x，否則5x）
     - 完全對沖（同檔股票反向曝險）可 100% 減收
     """
 

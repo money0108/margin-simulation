@@ -78,8 +78,9 @@ class TestBucketReduction:
 
         # 分類器
         classifier = InstrumentClassifier(
-            futures_underlying_set={'2330'},  # 2330 是期貨標的 → 5x
-            constituent_set_0050_0056=set()   # 2891 非成分股 → 3x
+            futures_underlying_set={'2330'},
+            constituent_set_0050_0056=set(),
+            futures_leverage_map={'2330': 5.0}  # 2330 股期槓桿>7 → 5x；2891 非股期標的 → 3x
         )
 
         etf_lookthrough = ETFLookthrough({}, classifier)
@@ -158,7 +159,8 @@ class TestBucketReduction:
 
         classifier = InstrumentClassifier(
             futures_underlying_set={'2330'},
-            constituent_set_0050_0056=set()
+            constituent_set_0050_0056=set(),
+            futures_leverage_map={'2330': 5.0}
         )
 
         etf_lookthrough = ETFLookthrough({}, classifier)
@@ -235,7 +237,8 @@ class TestBucketReduction:
 
         classifier = InstrumentClassifier(
             futures_underlying_set={'2330', '2317'},
-            constituent_set_0050_0056=set()
+            constituent_set_0050_0056=set(),
+            futures_leverage_map={'2330': 5.0, '2317': 5.0}
         )
 
         etf_lookthrough = ETFLookthrough({}, classifier)
@@ -337,7 +340,8 @@ class TestBucketReduction:
 
         classifier = InstrumentClassifier(
             futures_underlying_set={'2330', '2317'},
-            constituent_set_0050_0056=set()
+            constituent_set_0050_0056=set(),
+            futures_leverage_map={'2330': 5.0, '2317': 5.0}
         )
 
         etf_lookthrough = ETFLookthrough({}, classifier)

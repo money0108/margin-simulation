@@ -20,6 +20,7 @@ import os
 from core.data_loader import DataLoader
 from core.engine import BacktestEngine, BacktestResults
 from core.reporting import ReportGenerator, verify
+from core.data_loader import DataLoader as _DL  # for compute_position_diffs
 
 # =============================================================================
 # 頁面設定
@@ -84,6 +85,12 @@ if 'backtest_results' not in st.session_state:
     st.session_state.backtest_results = None
 if 'positions' not in st.session_state:
     st.session_state.positions = None
+if 'position_schedule' not in st.session_state:
+    st.session_state.position_schedule = None
+if 'position_diffs' not in st.session_state:
+    st.session_state.position_diffs = None
+if 'multi_mode' not in st.session_state:
+    st.session_state.multi_mode = False
 
 
 # =============================================================================
@@ -100,16 +107,6 @@ def init_data_loader():
 
 
 @st.cache_data
-def load_sample_positions(_loader):
-    """載入示範部位（快取）"""
-    try:
-        positions = _loader.load_positions()
-        return positions, None
-    except Exception as e:
-        return None, str(e)
-
-
-@st.cache_data
 def get_trading_dates(_loader):
     """取得交易日列表（快取）"""
     try:
@@ -118,6 +115,58 @@ def get_trading_dates(_loader):
         return dates, None
     except Exception as e:
         return [], str(e)
+
+
+def estimate_mv(positions_df: pd.DataFrame, prices_df: pd.DataFrame,
+                as_of_date=None) -> dict:
+    """
+    用部位 + 股價估算多空市值摘要
+
+    Returns:
+        dict with long_mv, short_mv, long_count, short_count, total_count
+    """
+    if prices_df is None or len(prices_df) == 0:
+        return None
+
+    # 取最近可用日期的價格
+    if as_of_date is not None:
+        mask = prices_df['date'] <= pd.Timestamp(as_of_date)
+        if mask.any():
+            latest_date = prices_df.loc[mask, 'date'].max()
+        else:
+            latest_date = prices_df['date'].min()
+    else:
+        latest_date = prices_df['date'].max()
+
+    price_map = prices_df[prices_df['date'] == latest_date].set_index('code')['close'].to_dict()
+
+    long_mv = 0.0
+    short_mv = 0.0
+    long_count = 0
+    short_count = 0
+    missing = []
+
+    for _, row in positions_df.iterrows():
+        code = str(row['code']).strip()
+        qty = float(row['qty'])
+        price = price_map.get(code)
+        if price is None:
+            missing.append(code)
+            continue
+        mv = qty * price
+        if row['side'] == 'LONG':
+            long_mv += mv
+            long_count += 1
+        else:
+            short_mv += mv
+            short_count += 1
+
+    return {
+        'long_mv': long_mv, 'short_mv': short_mv,
+        'long_count': long_count, 'short_count': short_count,
+        'total_count': long_count + short_count,
+        'missing': missing,
+    }
 
 
 def load_prices_from_upload(uploaded_file):
@@ -189,6 +238,25 @@ def create_timeseries_chart(df: pd.DataFrame) -> go.Figure:
                   line=dict(color='#8c564b', width=2, dash='dot')),
         row=2, col=1
     )
+
+    # 部位變動日標記紫色虛線
+    if 'position_change_flag' in df.columns:
+        change_dates = df[df['position_change_flag'] == 1]['date']
+        for cd in change_dates:
+            cd_str = cd.isoformat() if hasattr(cd, 'isoformat') else str(cd)
+            for row_idx in [1, 2]:
+                fig.add_shape(
+                    type="line", x0=cd_str, x1=cd_str, y0=0, y1=1,
+                    yref="paper" if row_idx == 1 else f"y{row_idx} domain",
+                    line=dict(dash="dash", color="purple", width=1.5),
+                    row=row_idx, col=1
+                )
+            fig.add_annotation(
+                x=cd_str, y=1, yref="paper",
+                text="加減倉", showarrow=False,
+                font=dict(color="purple", size=10),
+                xanchor="left", yanchor="bottom"
+            )
 
     fig.update_layout(
         height=600,
@@ -356,6 +424,30 @@ def _generate_hedge_sections(results: BacktestResults) -> str:
         sections.append(section_html)
 
     return '\n'.join(sections)
+
+
+def _generate_position_change_html(results: BacktestResults) -> str:
+    """生成部位變動資訊的 HTML 區塊"""
+    if not results.position_change_events:
+        return ''
+
+    html = '<h2>📦 部位變動紀錄</h2>'
+
+    # 時間線
+    html += '<div style="margin-bottom:20px;">'
+    html += '<table><tr><th>日期</th><th>新 IM</th><th>新 MM</th><th>變動時權益</th><th>多方 MV</th><th>空方 MV</th><th>實現損益</th><th>出金</th></tr>'
+    for evt in results.position_change_events:
+        html += f"<tr><td>{evt['date'].strftime('%Y-%m-%d')}</td>"
+        html += f"<td>{evt['new_im']:,.0f}</td>"
+        html += f"<td>{evt['new_mm']:,.0f}</td>"
+        html += f"<td>{evt['equity_at_change']:,.0f}</td>"
+        html += f"<td>{evt['long_mv']:,.0f}</td>"
+        html += f"<td>{evt['short_mv']:,.0f}</td>"
+        html += f"<td>{evt.get('realized_pnl', 0):+,.0f}</td>"
+        html += f"<td>{evt.get('withdrawal', 0):,.0f}</td></tr>"
+    html += '</table></div>'
+
+    return html
 
 
 def create_html_report(results: BacktestResults, positions: pd.DataFrame) -> str:
@@ -567,6 +659,8 @@ def create_html_report(results: BacktestResults, positions: pd.DataFrame) -> str
 
         {f'<div class="warning"><strong>⚠️ 追繳事件：</strong>共 {len(results.margin_call_events)} 次追繳</div>' if results.margin_call_events else ''}
 
+        {_generate_position_change_html(results)}
+
         <div class="footer">
             <p>遠期契約保證金模擬平台 v1.0</p>
             <p>此報告由系統自動產生，僅供參考</p>
@@ -654,7 +748,12 @@ def create_full_report_excel(results: BacktestResults, positions: pd.DataFrame) 
         })
         assumptions_df.to_excel(writer, sheet_name='假設說明', index=False)
 
-        # 8. 缺碼清單
+        # 8. 部位變動事件
+        if results.position_change_events:
+            change_df = pd.DataFrame(results.position_change_events)
+            change_df.to_excel(writer, sheet_name='部位變動事件', index=False)
+
+        # 9. 缺碼清單
         if results.missing_codes:
             missing_df = pd.DataFrame({
                 '缺碼代號': results.missing_codes
@@ -700,6 +799,23 @@ def create_audit_zip(results: BacktestResults, positions: pd.DataFrame) -> bytes
         verification = verify(results)
         import json
         zf.writestr('verification.json', json.dumps(verification, ensure_ascii=False, indent=2).encode('utf-8'))
+
+        # 部位變動事件
+        if results.position_change_events:
+            change_df = pd.DataFrame(results.position_change_events)
+            csv_buffer = io.StringIO()
+            change_df.to_csv(csv_buffer, index=False)
+            zf.writestr('position_change_events.csv', csv_buffer.getvalue().encode('utf-8-sig'))
+
+        # 多期部位快照
+        if results.position_schedule and len(results.position_schedule) > 1:
+            for s_idx, (s_date, s_df) in enumerate(results.position_schedule):
+                csv_buffer = io.StringIO()
+                s_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+                zf.writestr(
+                    f'inputs_snapshot/positions_{s_date.strftime("%Y%m%d")}.csv',
+                    csv_buffer.getvalue().encode('utf-8-sig')
+                )
 
         # 逐日明細（首/中/末日）
         if results.daily_results:
@@ -748,10 +864,11 @@ def main():
         **關鍵規則清單：**
         | 類別 | 槓桿倍數 |
         |------|---------|
-        | 股票期貨標的 | 5x |
-        | 0050/0056 成份股 | 4x |
-        | 其他股票 | 3x |
-        | 0050/0056 ETF | 7x |
+        | ETF（月均量 ≥ 10,000 張） | 7x |
+        | ETF（月均量 < 10,000 張） | 5x |
+        | 股期標的（股期槓桿 > 7） | 5x |
+        | 股期標的（股期槓桿 > 6 且 ≤ 7） | 4x |
+        | 股期標的（股期槓桿 ≤ 6）/ 其他股票 | 3x |
 
         | 對沖類型 | 折減率 |
         |---------|-------|
@@ -813,73 +930,100 @@ def main():
     if st.session_state.prices_df is not None:
         loader.set_prices_df(st.session_state.prices_df)
 
-    # 部位上傳
+    # 部位上傳（統一介面：支援單檔或多檔）
     st.sidebar.subheader("1️⃣ 部位資料")
 
-    upload_option = st.sidebar.radio(
-        "選擇部位來源",
-        ["載入示範部位", "上傳 Excel 檔案"]
+    uploaded_files = st.sidebar.file_uploader(
+        "上傳部位 Excel（可多選）",
+        type=['xlsx', 'xls'],
+        accept_multiple_files=True,
+        help="單檔＝初始建倉；多檔＝最早日期為建倉，其餘為加倉/平倉。檔案第一列若為「日期 + 日期值」會自動偵測，否則需手動指定日期。",
+        key="position_upload"
     )
 
     positions = None
 
-    if upload_option == "載入示範部位":
-        if st.sidebar.button("載入示範部位"):
-            positions, error = load_sample_positions(loader)
-            if error:
-                st.sidebar.error(f"載入失敗：{error}")
-            else:
-                st.session_state.positions = positions
-                st.sidebar.success(f"已載入 {len(positions)} 筆部位")
+    if uploaded_files and len(uploaded_files) > 0:
+        # 解析每個檔案，檢查是否有日期標頭
+        parsed_files = []
+        needs_date = []
 
-    else:
-        uploaded_file = st.sidebar.file_uploader(
-            "上傳部位 Excel",
-            type=['xlsx', 'xls'],
-            help="欄位：代號、買進張數、賣出張數"
-        )
-
-        if uploaded_file is not None:
+        for idx, uf in enumerate(uploaded_files):
             try:
-                positions = loader.load_positions(uploaded_file)
-                st.session_state.positions = positions
-                st.sidebar.success(f"已載入 {len(positions)} 筆部位")
+                raw = pd.read_excel(uf, header=None)
+                cell_00 = str(raw.iloc[0, 0]).strip() if len(raw) > 0 else ''
+
+                if cell_00 == '日期':
+                    date_val = raw.iloc[0, 1]
+                    pos_date = pd.Timestamp(date_val)
+                    parsed_files.append({'file': uf, 'name': uf.name, 'date': pos_date, 'has_date': True})
+                else:
+                    parsed_files.append({'file': uf, 'name': uf.name, 'date': None, 'has_date': False})
+                    needs_date.append(idx)
             except Exception as e:
-                st.sidebar.error(f"檔案解析失敗：{e}")
+                st.sidebar.error(f"解析 {uf.name} 失敗：{e}")
+
+        # 對缺日期的檔案要求手動輸入
+        for idx in needs_date:
+            pf = parsed_files[idx]
+            user_date = st.sidebar.date_input(
+                f"指定 {pf['name']} 的日期",
+                key=f"pos_date_{idx}"
+            )
+            pf['date'] = pd.Timestamp(user_date)
+
+        # 所有檔案都有日期後，載入
+        all_have_dates = all(pf['date'] is not None for pf in parsed_files)
+
+        if all_have_dates and len(parsed_files) > 0:
+            try:
+                files_list = []
+                fallback_dates = []
+                for pf in parsed_files:
+                    pf['file'].seek(0)
+                    files_list.append(pf['file'])
+                    fallback_dates.append(pf['date'])
+
+                schedule = loader.load_multi_positions(files_list, fallback_dates)
+                st.session_state.position_schedule = schedule
+                st.session_state.positions = schedule[0][1]  # 第一期部位
+
+                if len(schedule) > 1:
+                    st.session_state.multi_mode = True
+                    diffs = _DL.compute_position_diffs(schedule)
+                    st.session_state.position_diffs = diffs
+                    st.sidebar.success(f"已載入 {len(schedule)} 期部位")
+                    for s_date, s_df in schedule:
+                        st.sidebar.caption(f"  {s_date.strftime('%Y-%m-%d')}: {len(s_df)} 筆")
+                else:
+                    st.session_state.multi_mode = False
+                    st.session_state.position_diffs = None
+                    st.sidebar.success(f"已載入 {len(schedule[0][1])} 筆部位（建倉日 {schedule[0][0].strftime('%Y-%m-%d')}）")
+
+            except Exception as e:
+                st.sidebar.error(f"部位載入失敗：{e}")
+                import traceback
+                st.sidebar.code(traceback.format_exc())
 
     # 使用 session state 中的部位
     if st.session_state.positions is not None:
         positions = st.session_state.positions
 
-    # 日期選擇
-    st.sidebar.subheader("2️⃣ 日期設定")
-
-    # 使用已載入的交易日
+    # 日期自動決定：建倉日 = schedule 第一個快照日期，結束日 = 股價最後一天
     trading_dates = st.session_state.trading_dates
 
-    if len(trading_dates) == 0:
-        st.sidebar.info("請先載入股價數據")
-    elif trading_dates:
-        # 預設建倉日：最近 60 個交易日前
+    if st.session_state.position_schedule and len(st.session_state.position_schedule) > 0:
+        start_date = st.session_state.position_schedule[0][0].date()
+    elif len(trading_dates) > 0:
         default_start_idx = max(0, len(trading_dates) - 60)
-        default_end_idx = len(trading_dates) - 1
+        start_date = trading_dates[default_start_idx].date()
+    else:
+        start_date = None
 
-        start_date = st.sidebar.date_input(
-            "建倉日期",
-            value=trading_dates[default_start_idx].date(),
-            min_value=trading_dates[0].date(),
-            max_value=trading_dates[-1].date()
-        )
-
-        end_date = st.sidebar.date_input(
-            "結束日期",
-            value=trading_dates[default_end_idx].date(),
-            min_value=trading_dates[0].date(),
-            max_value=trading_dates[-1].date()
-        )
+    end_date = trading_dates[-1].date() if len(trading_dates) > 0 else None
 
     # 顯示選項
-    st.sidebar.subheader("3️⃣ 顯示選項")
+    st.sidebar.subheader("2️⃣ 顯示選項")
 
     show_etf_lookthrough = st.sidebar.checkbox("顯示 ETF look-through 明細", value=False)
     show_reduction_detail = st.sidebar.checkbox("顯示折減來源分解", value=True)
@@ -887,11 +1031,13 @@ def main():
     # ==========================================================================
     # 執行回測
     # ==========================================================================
-    st.sidebar.subheader("4️⃣ 執行")
+    st.sidebar.subheader("3️⃣ 執行")
 
     if st.sidebar.button("🚀 開始模擬", type="primary", use_container_width=True):
         if positions is None or len(positions) == 0:
-            st.error("請先載入部位資料")
+            st.error("請先上傳部位檔案")
+        elif start_date is None or end_date is None:
+            st.error("股價數據尚未載入，無法決定模擬期間")
         else:
             try:
                 engine = BacktestEngine(loader)
@@ -912,12 +1058,21 @@ def main():
                     progress_bar.progress(pct, text=f"計算中... {current}/{total} ({pct:.0%})")
                     status_text.text(f"正在計算 {date_str}")
 
-                results = engine.run(
-                    positions=positions,
-                    start_date=pd.Timestamp(start_date),
-                    end_date=pd.Timestamp(end_date),
-                    progress_callback=progress_callback
-                )
+                # 統一走 position_schedule 路徑
+                if st.session_state.position_schedule:
+                    results = engine.run(
+                        position_schedule=st.session_state.position_schedule,
+                        start_date=pd.Timestamp(start_date),
+                        end_date=pd.Timestamp(end_date),
+                        progress_callback=progress_callback
+                    )
+                else:
+                    results = engine.run(
+                        positions=positions,
+                        start_date=pd.Timestamp(start_date),
+                        end_date=pd.Timestamp(end_date),
+                        progress_callback=progress_callback
+                    )
 
                 progress_bar.progress(1.0, text="計算完成！")
                 status_text.empty()
@@ -931,21 +1086,147 @@ def main():
     # ==========================================================================
     # 顯示部位
     # ==========================================================================
+    # 取得股價（用於估算市值）
+    try:
+        _prices_for_mv = loader.load_prices()
+    except Exception:
+        _prices_for_mv = None
+
     if positions is not None and len(positions) > 0:
         st.header("📋 部位清單")
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            long_count = len(positions[positions['side'] == 'LONG'])
-            st.metric("多方部位", f"{long_count} 檔")
-        with col2:
-            short_count = len(positions[positions['side'] == 'SHORT'])
-            st.metric("空方部位", f"{short_count} 檔")
-        with col3:
-            st.metric("總部位數", f"{len(positions)} 筆")
+        # 多期模式
+        if st.session_state.multi_mode and st.session_state.position_schedule and len(st.session_state.position_schedule) > 1:
+            schedule = st.session_state.position_schedule
 
-        with st.expander("查看部位明細", expanded=False):
-            st.dataframe(positions, use_container_width=True)
+            # --- 部位變動摘要 ---
+            diffs = st.session_state.position_diffs
+
+            # 建立 date → snapshot df 的快速查找
+            schedule_map = {pd.Timestamp(s_date): s_df for s_date, s_df in schedule}
+
+            st.subheader("部位變動摘要")
+            summary_records = []
+
+            # 先加建倉日（schedule[0]）
+            s0_date, s0_df = schedule[0]
+            mv0 = estimate_mv(s0_df, _prices_for_mv, as_of_date=s0_date)
+            summary_records.append({
+                '日期': s0_date.strftime('%Y-%m-%d'),
+                '類型': '建倉',
+                '多方市值': f"{mv0['long_mv']:,.0f}" if mv0 else '-',
+                '空方市值': f"{mv0['short_mv']:,.0f}" if mv0 else '-',
+                '淨市值': f"{mv0['long_mv'] - mv0['short_mv']:+,.0f}" if mv0 else '-',
+                '實現損益': '-', '出金': '-',
+                '新增': '-', '平倉': '-', '加倉': '-',
+                '減倉': '-', '翻倉': '-', '變動筆數': '-',
+            })
+
+            # 若有回測結果，建立 date → event 查找（含實現損益/出金）
+            _bt_results = st.session_state.backtest_results
+            _evt_map = {}
+            if _bt_results and _bt_results.position_change_events:
+                for evt in _bt_results.position_change_events:
+                    _evt_map[pd.Timestamp(evt['date'])] = evt
+
+            # 各次變動
+            if diffs:
+                for d in diffs:
+                    type_counts = d['diff_df']['變動類型'].value_counts().to_dict() if len(d['diff_df']) > 0 else {}
+                    # 找該日期對應的 snapshot 算市值
+                    snap_df = schedule_map.get(pd.Timestamp(d['date']))
+                    mv = estimate_mv(snap_df, _prices_for_mv, as_of_date=d['date']) if snap_df is not None else None
+                    # 從回測結果取實現損益/出金
+                    evt = _evt_map.get(pd.Timestamp(d['date']))
+                    summary_records.append({
+                        '日期': d['date'].strftime('%Y-%m-%d'),
+                        '類型': '加減倉',
+                        '多方市值': f"{mv['long_mv']:,.0f}" if mv else '-',
+                        '空方市值': f"{mv['short_mv']:,.0f}" if mv else '-',
+                        '淨市值': f"{mv['long_mv'] - mv['short_mv']:+,.0f}" if mv else '-',
+                        '實現損益': f"{evt['realized_pnl']:+,.0f}" if evt else '-',
+                        '出金': f"{evt['withdrawal']:,.0f}" if evt else '-',
+                        '新增': type_counts.get('新增', 0),
+                        '平倉': type_counts.get('平倉', 0),
+                        '加倉': type_counts.get('加倉', 0),
+                        '減倉': type_counts.get('減倉', 0),
+                        '翻倉': type_counts.get('翻倉', 0),
+                        '變動筆數': len(d['diff_df']),
+                    })
+
+            st.dataframe(pd.DataFrame(summary_records), use_container_width=True, hide_index=True)
+
+            # --- 各期部位 tabs ---
+            tab_labels = []
+            for t_idx, (s_date, s_df) in enumerate(schedule):
+                label = f"{s_date.strftime('%Y-%m-%d')}"
+                if t_idx == 0:
+                    label += " (建倉)"
+                tab_labels.append(label)
+
+            pos_tabs = st.tabs(tab_labels)
+
+            for t_idx, (s_date, s_df) in enumerate(schedule):
+                with pos_tabs[t_idx]:
+                    mv_info = estimate_mv(s_df, _prices_for_mv, as_of_date=s_date)
+                    if mv_info:
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        with c1:
+                            st.metric("多方", f"{mv_info['long_count']} 檔")
+                        with c2:
+                            st.metric("多方市值", f"{mv_info['long_mv']:,.0f}")
+                        with c3:
+                            st.metric("空方", f"{mv_info['short_count']} 檔")
+                        with c4:
+                            st.metric("空方市值", f"{mv_info['short_mv']:,.0f}")
+                        with c5:
+                            net = mv_info['long_mv'] - mv_info['short_mv']
+                            st.metric("淨市值", f"{net:+,.0f}")
+                    else:
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.metric("多方", f"{len(s_df[s_df['side']=='LONG'])} 檔")
+                        with c2:
+                            st.metric("空方", f"{len(s_df[s_df['side']=='SHORT'])} 檔")
+                        with c3:
+                            st.metric("總部位", f"{len(s_df)} 筆")
+
+                    # 若有對應的差異資料，顯示該期變動
+                    if diffs and t_idx > 0 and t_idx - 1 < len(diffs):
+                        diff_df = diffs[t_idx - 1]['diff_df']
+                        if len(diff_df) > 0:
+                            st.caption("與前期差異：")
+                            st.dataframe(diff_df, use_container_width=True, height=180, hide_index=True)
+
+                    st.dataframe(s_df, use_container_width=True, height=250)
+        else:
+            # 單期模式
+            as_of = start_date if start_date else None
+            mv_info = estimate_mv(positions, _prices_for_mv, as_of_date=as_of)
+            if mv_info:
+                c1, c2, c3, c4, c5 = st.columns(5)
+                with c1:
+                    st.metric("多方", f"{mv_info['long_count']} 檔")
+                with c2:
+                    st.metric("多方市值", f"{mv_info['long_mv']:,.0f}")
+                with c3:
+                    st.metric("空方", f"{mv_info['short_count']} 檔")
+                with c4:
+                    st.metric("空方市值", f"{mv_info['short_mv']:,.0f}")
+                with c5:
+                    net = mv_info['long_mv'] - mv_info['short_mv']
+                    st.metric("淨市值", f"{net:+,.0f}")
+            else:
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("多方", f"{len(positions[positions['side']=='LONG'])} 檔")
+                with c2:
+                    st.metric("空方", f"{len(positions[positions['side']=='SHORT'])} 檔")
+                with c3:
+                    st.metric("總部位", f"{len(positions)} 筆")
+
+            with st.expander("查看部位明細", expanded=False):
+                st.dataframe(positions, use_container_width=True)
 
     # ==========================================================================
     # 顯示結果
@@ -1002,22 +1283,288 @@ def main():
             # 圖表
             st.subheader("📈 時序圖表")
 
-            tab1, tab2, tab3 = st.tabs(["IM/MM/Equity", "市值變化", "折減分解"])
+            # 決定是否顯示部位變動頁籤
+            has_pos_changes = (
+                st.session_state.position_diffs is not None
+                and len(st.session_state.position_diffs) > 0
+            )
 
-            with tab1:
+            tab_names = ["IM/MM/Equity", "市值變化", "折減分解"]
+            if has_pos_changes:
+                tab_names.append("部位變動")
+                tab_names.append("資金流向")
+
+            chart_tabs = st.tabs(tab_names)
+
+            with chart_tabs[0]:
                 fig = create_timeseries_chart(ts)
                 st.plotly_chart(fig, use_container_width=True)
 
-            with tab2:
+            with chart_tabs[1]:
                 fig = create_mv_chart(ts)
                 st.plotly_chart(fig, use_container_width=True)
 
-            with tab3:
+            with chart_tabs[2]:
                 if show_reduction_detail:
                     fig = create_reduction_chart(ts)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("請在側邊欄勾選「顯示折減來源分解」")
+
+            if has_pos_changes:
+                with chart_tabs[3]:
+                    st.markdown("### 部位變動時間線")
+
+                    # 變動時間線表格
+                    schedule = st.session_state.position_schedule
+                    # 建立 event 查找
+                    _change_evt_map = {}
+                    if results.position_change_events:
+                        for evt in results.position_change_events:
+                            _change_evt_map[pd.Timestamp(evt['date'])] = evt
+
+                    timeline_records = []
+                    for t_idx, (s_date, s_df) in enumerate(schedule):
+                        long_count = len(s_df[s_df['side'] == 'LONG'])
+                        short_count = len(s_df[s_df['side'] == 'SHORT'])
+                        evt = _change_evt_map.get(pd.Timestamp(s_date))
+                        rec = {
+                            '快照日期': s_date.strftime('%Y-%m-%d'),
+                            '多方數量': long_count,
+                            '空方數量': short_count,
+                            '總部位數': len(s_df),
+                        }
+                        if t_idx == 0:
+                            rec['新 IM'] = f"{results.timeseries_df.iloc[0]['IM_today']:,.0f}" if len(results.timeseries_df) > 0 else '-'
+                            rec['變動時權益'] = '-'
+                            rec['實現損益'] = '-'
+                            rec['出金'] = '-'
+                        elif evt:
+                            rec['新 IM'] = f"{evt['new_im']:,.0f}"
+                            rec['變動時權益'] = f"{evt['equity_at_change']:,.0f}"
+                            rec['實現損益'] = f"{evt['realized_pnl']:+,.0f}"
+                            rec['出金'] = f"{evt['withdrawal']:,.0f}"
+                        else:
+                            rec['新 IM'] = '-'
+                            rec['變動時權益'] = '-'
+                            rec['實現損益'] = '-'
+                            rec['出金'] = '-'
+                        timeline_records.append(rec)
+
+                    timeline_df = pd.DataFrame(timeline_records)
+                    st.dataframe(timeline_df, use_container_width=True, hide_index=True)
+
+                    # 逐期差異表
+                    st.markdown("### 逐期差異明細")
+                    diffs = st.session_state.position_diffs
+                    diff_tab_names = [
+                        f"{d['prev_date'].strftime('%m/%d')} → {d['date'].strftime('%m/%d')}"
+                        for d in diffs
+                    ]
+                    diff_tabs = st.tabs(diff_tab_names)
+
+                    for d_idx, diff_info in enumerate(diffs):
+                        with diff_tabs[d_idx]:
+                            diff_df = diff_info['diff_df']
+                            st.caption(
+                                f"從 {diff_info['prev_date'].strftime('%Y-%m-%d')} "
+                                f"到 {diff_info['date'].strftime('%Y-%m-%d')} 的變動"
+                            )
+                            if len(diff_df) > 0:
+                                # 變動類型摘要
+                                type_counts = diff_df['變動類型'].value_counts()
+                                summary_cols = st.columns(min(len(type_counts), 6))
+                                for ci, (change_type, count) in enumerate(type_counts.items()):
+                                    with summary_cols[ci % len(summary_cols)]:
+                                        st.metric(change_type, f"{count} 筆")
+
+                                st.dataframe(diff_df, use_container_width=True, hide_index=True)
+                            else:
+                                st.info("無部位變動")
+
+                with chart_tabs[4]:
+                    st.markdown("### 資金流向分析")
+
+                    if results.position_change_events:
+                        # 建立子頁籤：每次變動一個
+                        flow_tab_names = []
+                        for evt_idx, evt in enumerate(results.position_change_events):
+                            evt_date_str = evt['date'].strftime('%m/%d')
+                            # 找前一個日期
+                            if evt_idx == 0:
+                                schedule = st.session_state.position_schedule
+                                prev_date_str = schedule[0][0].strftime('%m/%d')
+                            else:
+                                prev_date_str = results.position_change_events[evt_idx - 1]['date'].strftime('%m/%d')
+                            flow_tab_names.append(f"{prev_date_str} → {evt_date_str}")
+
+                        flow_tabs = st.tabs(flow_tab_names)
+
+                        for evt_idx, evt in enumerate(results.position_change_events):
+                            with flow_tabs[evt_idx]:
+                                evt_date_str = evt['date'].strftime('%Y-%m-%d')
+
+                                # --- 區塊 A：變動前後比較表 ---
+                                st.markdown(f"#### 變動前後比較（{evt_date_str}）")
+
+                                old_long_mv = evt.get('old_long_mv', 0)
+                                old_short_mv = evt.get('old_short_mv', 0)
+                                new_long_mv = evt.get('long_mv', 0)
+                                new_short_mv = evt.get('short_mv', 0)
+                                old_im = evt.get('old_im', 0)
+                                new_im = evt.get('new_im', 0)
+                                old_mm = evt.get('old_mm', 0)
+                                new_mm = evt.get('new_mm', 0)
+
+                                compare_data = {
+                                    '項目': ['多方 MV', '空方 MV', 'IM', 'MM'],
+                                    '變動前': [
+                                        f"{old_long_mv:,.0f}",
+                                        f"{old_short_mv:,.0f}",
+                                        f"{old_im:,.0f}",
+                                        f"{old_mm:,.0f}",
+                                    ],
+                                    '變動後': [
+                                        f"{new_long_mv:,.0f}",
+                                        f"{new_short_mv:,.0f}",
+                                        f"{new_im:,.0f}",
+                                        f"{new_mm:,.0f}",
+                                    ],
+                                    '差異': [
+                                        f"{new_long_mv - old_long_mv:+,.0f}",
+                                        f"{new_short_mv - old_short_mv:+,.0f}",
+                                        f"{new_im - old_im:+,.0f}",
+                                        f"{new_mm - old_mm:+,.0f}",
+                                    ],
+                                }
+                                st.dataframe(
+                                    pd.DataFrame(compare_data),
+                                    use_container_width=True,
+                                    hide_index=True
+                                )
+
+                                # --- 區塊 B：資金流向瀑布 ---
+                                st.markdown("#### 資金流向")
+
+                                equity_before = evt.get('equity_before_change', 0)
+                                realized_pnl = evt.get('realized_pnl', 0)
+                                withdrawal = evt.get('withdrawal', 0)
+                                equity_after = evt.get('equity_at_change', 0)
+
+                                # 可出金金額計算公式
+                                excess_over_im = max(0, equity_before - new_im)
+                                max_withdrawal = min(realized_pnl, excess_over_im) if realized_pnl > 0 else 0
+
+                                flow_md = f"""
+| 步驟 | 說明 | 金額 |
+|------|------|-----:|
+| 1 | 變動前權益（舊部位以當日價格結算） | **{equity_before:,.0f}** |
+| 2 | 實現損益（平/減倉部位按基準價差計算） | **{realized_pnl:+,.0f}** |
+| 3 | 可出金金額 = min(實現損益, max(0, 權益 - 新IM)) | **{max_withdrawal:,.0f}** |
+| 4 | 實際出金 | **-{withdrawal:,.0f}** |
+| 5 | 出金後權益 | **{equity_after:,.0f}** |
+"""
+                                st.markdown(flow_md)
+
+                                # --- 區塊 B2：出金來源 — 逐部位實現損益明細 ---
+                                pnl_details = evt.get('realized_pnl_details', [])
+                                if pnl_details:
+                                    st.markdown("#### 出金來源 — 逐部位實現損益明細")
+                                    detail_records = []
+                                    for d in pnl_details:
+                                        side_label = '多' if d['side'] == 'LONG' else '空'
+                                        detail_records.append({
+                                            '代號': d['code'],
+                                            '方向': side_label,
+                                            '變動': d['change_type'],
+                                            '原數量': f"{d['old_qty']:,}",
+                                            '新數量': f"{d['new_qty']:,}",
+                                            '平/減量': f"{d['closed_qty']:,}",
+                                            '基準價': f"{d['base_price']:.2f}",
+                                            '當日價': f"{d['current_price']:.2f}",
+                                            '價差': f"{d['current_price'] - d['base_price']:+.2f}" if d['side'] == 'LONG' else f"{d['base_price'] - d['current_price']:+.2f}",
+                                            '實現損益': f"{d['pnl']:+,.0f}",
+                                        })
+                                    detail_df = pd.DataFrame(detail_records)
+                                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+                                    # 小計
+                                    total_pnl = sum(d['pnl'] for d in pnl_details)
+                                    profit_count = sum(1 for d in pnl_details if d['pnl'] > 0)
+                                    loss_count = sum(1 for d in pnl_details if d['pnl'] < 0)
+                                    profit_sum = sum(d['pnl'] for d in pnl_details if d['pnl'] > 0)
+                                    loss_sum = sum(d['pnl'] for d in pnl_details if d['pnl'] < 0)
+
+                                    sc1, sc2, sc3, sc4 = st.columns(4)
+                                    with sc1:
+                                        st.metric("獲利部位", f"{profit_count} 檔", delta=f"{profit_sum:+,.0f}")
+                                    with sc2:
+                                        st.metric("虧損部位", f"{loss_count} 檔", delta=f"{loss_sum:+,.0f}", delta_color="inverse")
+                                    with sc3:
+                                        st.metric("實現損益合計", f"{total_pnl:+,.0f}")
+                                    with sc4:
+                                        st.metric("實際出金", f"{withdrawal:,.0f}")
+                                elif realized_pnl == 0:
+                                    st.caption("本次變動無平倉/減倉部位，無實現損益。")
+
+                                # --- 區塊 C：融資金額變化 ---
+                                st.markdown("#### 融資金額變化")
+
+                                old_long_fin = evt.get('old_long_financing', 0)
+                                old_short_fin = evt.get('old_short_financing', 0)
+                                new_long_fin = evt.get('new_long_financing', 0)
+                                new_short_fin = evt.get('new_short_financing', 0)
+                                old_total_fin = old_long_fin + old_short_fin
+                                new_total_fin = new_long_fin + new_short_fin
+
+                                fin_data = {
+                                    '項目': ['多方融資', '空方融資', '總融資'],
+                                    '變動前': [
+                                        f"{old_long_fin:,.0f}",
+                                        f"{old_short_fin:,.0f}",
+                                        f"{old_total_fin:,.0f}",
+                                    ],
+                                    '變動後': [
+                                        f"{new_long_fin:,.0f}",
+                                        f"{new_short_fin:,.0f}",
+                                        f"{new_total_fin:,.0f}",
+                                    ],
+                                    '差異': [
+                                        f"{new_long_fin - old_long_fin:+,.0f}",
+                                        f"{new_short_fin - old_short_fin:+,.0f}",
+                                        f"{new_total_fin - old_total_fin:+,.0f}",
+                                    ],
+                                    '說明': [
+                                        '多方MV - 帳上資金',
+                                        '借券全額',
+                                        '',
+                                    ],
+                                }
+                                st.dataframe(
+                                    pd.DataFrame(fin_data),
+                                    use_container_width=True,
+                                    hide_index=True
+                                )
+
+                                st.info(
+                                    "出金使帳上資金減少，券商需多融出資金以維持多方市值。"
+                                    "空方融資 = 借券市值，隨部位MV變動。"
+                                )
+
+                                # --- 區塊 D：規則說明 ---
+                                with st.expander("計算規則說明"):
+                                    st.markdown("""
+- **IM 重算邏輯**：部位變動後，以新部位重新計算 IM（含分邊、大小邊、對沖折減）
+- **MM = 新 IM x 70%**：部位變動後 MM 重置為新 IM 的 70%
+- **出金規則**：僅就「已平倉/減倉部位的實現損益」可出金，且出金後權益不低於新 IM
+  - 可出金金額 = min(實現損益, max(0, 權益 - 新IM))
+- **融資公式**：
+  - 多方融資 = max(0, 多方MV - 帳上資金)
+  - 空方融資 = 空方MV（借券賣出全額融資）
+- **追繳**：若出金後權益 < MM → 立即追繳至新 IM
+""")
+                    else:
+                        st.info("無部位變動事件")
 
             # 逐日明細表 - 拆成兩個表
             st.subheader("📋 逐日明細")
@@ -1032,7 +1579,7 @@ def main():
                           'Daily_PnL_Long', 'Daily_PnL_Short', 'Daily_PnL',
                           'Cum_PnL_Long', 'Cum_PnL_Short', 'Cumulative_PnL',
                           'Equity_Before', 'MM_At_Call', 'IM_today',
-                          'margin_call_flag', 'Required_Deposit', 'Equity', 'MM_today']
+                          'margin_call_flag', 'Required_Deposit', 'Withdrawal', 'Equity', 'MM_today']
             equity_df = display_df[[c for c in equity_cols if c in display_df.columns]].copy()
 
             # 格式化金額
@@ -1040,7 +1587,7 @@ def main():
                            'Daily_PnL_Long', 'Daily_PnL_Short', 'Daily_PnL',
                            'Cum_PnL_Long', 'Cum_PnL_Short', 'Cumulative_PnL',
                            'Equity_Before', 'MM_At_Call', 'IM_today', 'Required_Deposit',
-                           'Equity', 'MM_today']
+                           'Withdrawal', 'Equity', 'MM_today']
             for col in money_cols_1:
                 if col in equity_df.columns:
                     equity_df[col] = equity_df[col].apply(lambda x: f"{x:,.0f}")
@@ -1052,7 +1599,7 @@ def main():
                 'Cum_PnL_Long': '多方累計', 'Cum_PnL_Short': '空方累計', 'Cumulative_PnL': '合計累計',
                 'Equity_Before': '權益(判定)', 'MM_At_Call': 'MM(判定)', 'IM_today': 'IM',
                 'margin_call_flag': '追繳', 'Required_Deposit': '追繳金額',
-                'Equity': '權益(補後)', 'MM_today': 'MM(補後)'
+                'Withdrawal': '出金', 'Equity': '權益(補後)', 'MM_today': 'MM(補後)'
             })
 
             st.dataframe(equity_df, use_container_width=True, height=300)

@@ -561,7 +561,7 @@ class DataLoader:
     def get_futures_underlying_set(self,
                                    path: Optional[str] = None) -> set:
         """
-        取得股票期貨標的代碼集合（用於判定 5x 槓桿）
+        取得股票期貨標的代碼集合
 
         Returns:
             股票期貨標的代碼集合
@@ -570,6 +570,49 @@ class DataLoader:
         if 'underlying_code' in df.columns:
             return set(df['underlying_code'].dropna().astype(str).str.strip())
         return set()
+
+    def get_futures_leverage_mapping(self,
+                                     path: Optional[str] = None) -> Dict[str, float]:
+        """
+        依股票期貨槓桿倍數建立現貨標的 → 遠期槓桿倍數的動態對應表
+
+        規則：
+        - 股期槓桿倍數 > 7  → 該標的遠期槓桿 5 倍
+        - 股期槓桿倍數 > 6 且 ≤ 7 → 該標的遠期槓桿 4 倍
+        - 股期槓桿倍數 ≤ 6  → 該標的遠期槓桿 3 倍
+        - ETF 期貨不納入（ETF 一律 7 倍，另行處理）
+
+        同一現貨標的若有多筆期貨（如一般型＋小型），取最大股期槓桿倍數判定。
+
+        Returns:
+            Dict[str, float]  {現貨標的代碼: 遠期槓桿倍數}
+        """
+        df = self.load_leverage_table(path)
+
+        if 'futures_name' not in df.columns or 'underlying_code' not in df.columns or 'leverage_ratio' not in df.columns:
+            # 欄位不足，退回空字典
+            return {}
+
+        # 排除 ETF 期貨（名稱含 "ETF"）
+        df = df[~df['futures_name'].str.contains('ETF', na=False)].copy()
+
+        df['underlying_code'] = df['underlying_code'].astype(str).str.strip()
+        df['leverage_ratio'] = pd.to_numeric(df['leverage_ratio'], errors='coerce')
+        df = df.dropna(subset=['underlying_code', 'leverage_ratio'])
+
+        # 同一標的取最大股期槓桿倍數
+        best = df.groupby('underlying_code')['leverage_ratio'].max()
+
+        mapping: Dict[str, float] = {}
+        for code, futures_lev in best.items():
+            if futures_lev > 7:
+                mapping[code] = 5.0
+            elif futures_lev > 6:
+                mapping[code] = 4.0
+            else:
+                mapping[code] = 3.0
+
+        return mapping
 
     # =========================================================================
     # ETF 成分股權重載入
@@ -638,7 +681,7 @@ class DataLoader:
 
     def get_etf_constituent_set(self, path: Optional[str] = None) -> set:
         """
-        取得 0050/0056 成分股代碼集合（用於判定 4x 槓桿）
+        取得 0050/0056 成分股代碼集合（用於 ETF look-through）
 
         Returns:
             成分股代碼集合
@@ -649,42 +692,54 @@ class DataLoader:
             codes.update(df['code'].astype(str).str.strip())
         return codes
 
+    def get_etf_volume_map(self,
+                          prices_df: Optional[pd.DataFrame] = None,
+                          lookback_days: int = 20) -> Dict[str, float]:
+        """
+        從股價資料計算 ETF 月均量（近 N 個交易日的日均成交量，單位：張）
+
+        Args:
+            prices_df: 股價 DataFrame（需含 code, volume 欄位），若為 None 則自動載入
+            lookback_days: 回看交易日數（預設 20 日 ≈ 1 個月）
+
+        Returns:
+            Dict[str, float]  {ETF 代碼: 月均量（張）}
+        """
+        if prices_df is None:
+            prices_df = self.load_prices()
+
+        if 'volume' not in prices_df.columns:
+            return {}
+
+        # 取得所有可能的 ETF 代碼（以 0 開頭或 4 碼以下的代碼）
+        prices_df = prices_df.copy()
+        prices_df['volume'] = pd.to_numeric(prices_df['volume'], errors='coerce')
+
+        # 每檔取最近 lookback_days 個交易日的均量
+        result: Dict[str, float] = {}
+        for code, grp in prices_df.groupby('code'):
+            grp = grp.sort_values('date')
+            recent = grp.tail(lookback_days)
+            vol = recent['volume'].dropna()
+            if len(vol) > 0:
+                result[str(code)] = float(vol.mean())
+
+        return result
+
     # =========================================================================
     # 部位資料載入
     # =========================================================================
 
-    def load_positions(self,
-                      xlsx_path_or_buffer: Union[str, BytesIO, None] = None,
-                      use_cache: bool = False) -> pd.DataFrame:
+    def _parse_position_rows(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        載入部位清單（Excel）
+        從原始 DataFrame 解析部位資料（私有方法）
 
         Args:
-            xlsx_path_or_buffer: Excel 檔案路徑或上傳的檔案緩衝區
-            use_cache: 是否使用快取（上傳檔案不使用快取）
+            df: 原始 DataFrame（代號/買進張數/賣出張數 或 標準格式）
 
         Returns:
-            DataFrame，欄位: trade_date, code, side, qty, instrument, entry_price
+            標準化 DataFrame（code, side, qty, instrument）
         """
-        if xlsx_path_or_buffer is None:
-            xlsx_path_or_buffer = self.config['paths']['sample_positions']
-
-        # 判斷是路徑還是緩衝區
-        is_path = isinstance(xlsx_path_or_buffer, str)
-
-        if is_path:
-            is_valid, error_msg = self._validate_path(xlsx_path_or_buffer)
-            if not is_valid:
-                # 嘗試從雲端下載
-                cloud_path = self._download_cloud_data('sample_positions')
-                if cloud_path:
-                    xlsx_path_or_buffer = cloud_path
-                else:
-                    raise FileNotFoundError(error_msg)
-
-        # 載入資料
-        df = pd.read_excel(xlsx_path_or_buffer)
-
         # 處理「模擬1l部位.xlsx」格式：代號, 買進張數, 賣出張數
         if '代號' in df.columns and ('買進張數' in df.columns or '賣出張數' in df.columns):
             positions = []
@@ -747,6 +802,237 @@ class DataLoader:
                 raise ValueError(f"部位資料缺少必要欄位: {missing}")
 
         return result
+
+    def load_positions(self,
+                      xlsx_path_or_buffer: Union[str, BytesIO, None] = None,
+                      use_cache: bool = False) -> pd.DataFrame:
+        """
+        載入部位清單（Excel）
+        自動偵測日期標頭格式（第一列 '日期' + 日期值），若有則跳過日期列解析部位。
+
+        Args:
+            xlsx_path_or_buffer: Excel 檔案路徑或上傳的檔案緩衝區
+            use_cache: 是否使用快取（上傳檔案不使用快取）
+
+        Returns:
+            DataFrame，欄位: code, side, qty, instrument
+        """
+        if xlsx_path_or_buffer is None:
+            xlsx_path_or_buffer = self.config['paths']['sample_positions']
+
+        # 判斷是路徑還是緩衝區
+        is_path = isinstance(xlsx_path_or_buffer, str)
+
+        if is_path:
+            is_valid, error_msg = self._validate_path(xlsx_path_or_buffer)
+            if not is_valid:
+                # 嘗試從雲端下載
+                cloud_path = self._download_cloud_data('sample_positions')
+                if cloud_path:
+                    xlsx_path_or_buffer = cloud_path
+                else:
+                    raise FileNotFoundError(error_msg)
+
+        # 先用 header=None 讀取以偵測日期標頭
+        raw = pd.read_excel(xlsx_path_or_buffer, header=None)
+        cell_00 = str(raw.iloc[0, 0]).strip() if len(raw) > 0 else ''
+
+        if cell_00 == '日期':
+            # 有日期標頭：row 1 是欄位名稱，row 2+ 是資料
+            df = raw.iloc[1:].copy()
+            df.columns = df.iloc[0]
+            df = df.iloc[1:].reset_index(drop=True)
+            df.columns = [str(c).strip() for c in df.columns]
+        else:
+            # 一般格式：row 0 是欄位名稱
+            df = raw.copy()
+            df.columns = df.iloc[0]
+            df = df.iloc[1:].reset_index(drop=True)
+            df.columns = [str(c).strip() for c in df.columns]
+
+        return self._parse_position_rows(df)
+
+    def load_positions_with_date(self,
+                                 xlsx_path_or_buffer: Union[str, BytesIO],
+                                 fallback_date: Optional[pd.Timestamp] = None
+                                 ) -> Tuple[pd.Timestamp, pd.DataFrame]:
+        """
+        載入含日期標頭的部位 Excel
+
+        檢查 [0,0] 是否為 '日期'：
+        - 有日期：從 [0,1] 取得日期，再從 row 1 開始解析部位
+        - 無日期：使用 fallback_date，整份當一般格式解析
+
+        Args:
+            xlsx_path_or_buffer: Excel 檔案路徑或上傳的檔案緩衝區
+            fallback_date: 當檔案無日期標頭時使用的預設日期
+
+        Returns:
+            (date, positions_df)
+        """
+        # 先用 header=None 讀取以檢查第一列
+        raw = pd.read_excel(xlsx_path_or_buffer, header=None)
+
+        cell_00 = str(raw.iloc[0, 0]).strip() if len(raw) > 0 else ''
+
+        if cell_00 == '日期':
+            # 從 [0,1] 取得日期
+            date_val = raw.iloc[0, 1]
+            if isinstance(date_val, str):
+                pos_date = pd.Timestamp(date_val)
+            else:
+                pos_date = pd.Timestamp(date_val)
+
+            # row 1 是欄位名稱，row 2+ 是資料
+            df = raw.iloc[1:].copy()
+            df.columns = df.iloc[0]
+            df = df.iloc[1:].reset_index(drop=True)
+            # 清理欄位名（移除可能的 NaN 列名）
+            df.columns = [str(c).strip() for c in df.columns]
+
+            positions_df = self._parse_position_rows(df)
+            return (pos_date, positions_df)
+        else:
+            # 無日期標頭，當一般格式解析
+            if fallback_date is None:
+                raise ValueError("檔案無日期標頭且未提供 fallback_date")
+
+            # 重新讀取（有 header）
+            if isinstance(xlsx_path_or_buffer, BytesIO):
+                xlsx_path_or_buffer.seek(0)
+            df = pd.read_excel(xlsx_path_or_buffer)
+            positions_df = self._parse_position_rows(df)
+            return (pd.Timestamp(fallback_date), positions_df)
+
+    def load_multi_positions(self,
+                              files: List[Union[str, BytesIO]],
+                              fallback_dates: Optional[List[Optional[pd.Timestamp]]] = None
+                              ) -> List[Tuple[pd.Timestamp, pd.DataFrame]]:
+        """
+        載入多個部位 Excel 檔，逐一解析並依日期排序
+
+        Args:
+            files: Excel 檔案路徑或緩衝區列表
+            fallback_dates: 各檔案的預設日期列表（對應 files 順序）
+
+        Returns:
+            List[(date, positions_df)]，依日期排序
+        """
+        if fallback_dates is None:
+            fallback_dates = [None] * len(files)
+
+        snapshots = []
+        for i, f in enumerate(files):
+            fb_date = fallback_dates[i] if i < len(fallback_dates) else None
+            date, pos_df = self.load_positions_with_date(f, fallback_date=fb_date)
+            snapshots.append((date, pos_df))
+
+        # 依日期排序
+        snapshots.sort(key=lambda x: x[0])
+        return snapshots
+
+    @staticmethod
+    def compute_position_diffs(snapshots: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> List[Dict]:
+        """
+        比對相鄰快照，輸出每個日期的變動明細
+
+        Args:
+            snapshots: List[(date, positions_df)]，已依日期排序
+
+        Returns:
+            List[Dict]，每個 dict 含 date, diff_df
+            diff_df 欄位：代號, 變動類型, 原方向, 新方向, 原張數, 新張數, 差異張數
+        """
+        if len(snapshots) < 2:
+            return []
+
+        multiplier = 1000  # 股/張 轉換
+
+        diffs = []
+        for i in range(1, len(snapshots)):
+            prev_date, prev_df = snapshots[i - 1]
+            curr_date, curr_df = snapshots[i]
+
+            # 建立 code -> {side, qty} 映射
+            def build_map(df):
+                m = {}
+                for _, row in df.iterrows():
+                    code = str(row['code']).strip()
+                    side = row['side']
+                    qty = int(row['qty'])
+                    # 以 code 為 key，可能同 code 有 LONG 和 SHORT
+                    key = code
+                    if key not in m:
+                        m[key] = {}
+                    m[key][side] = qty
+                return m
+
+            prev_map = build_map(prev_df)
+            curr_map = build_map(curr_df)
+
+            all_codes = sorted(set(list(prev_map.keys()) + list(curr_map.keys())))
+
+            records = []
+            for code in all_codes:
+                prev_sides = prev_map.get(code, {})
+                curr_sides = curr_map.get(code, {})
+
+                # 計算前期淨部位（LONG 為正，SHORT 為負）
+                prev_net = prev_sides.get('LONG', 0) - prev_sides.get('SHORT', 0)
+                curr_net = curr_sides.get('LONG', 0) - curr_sides.get('SHORT', 0)
+
+                prev_side_str = 'LONG' if prev_net > 0 else ('SHORT' if prev_net < 0 else '無')
+                curr_side_str = 'LONG' if curr_net > 0 else ('SHORT' if curr_net < 0 else '無')
+
+                prev_qty_lots = abs(prev_net) / multiplier
+                curr_qty_lots = abs(curr_net) / multiplier
+                diff_lots = curr_qty_lots - prev_qty_lots
+
+                if prev_net == 0 and curr_net == 0:
+                    continue
+
+                # 判定變動類型
+                if prev_net == 0 and curr_net != 0:
+                    change_type = '新增'
+                elif prev_net != 0 and curr_net == 0:
+                    change_type = '平倉'
+                elif (prev_net > 0 and curr_net < 0) or (prev_net < 0 and curr_net > 0):
+                    change_type = '翻倉'
+                elif abs(curr_net) > abs(prev_net) and (
+                    (prev_net > 0 and curr_net > 0) or (prev_net < 0 and curr_net < 0)
+                ):
+                    change_type = '加倉'
+                elif abs(curr_net) < abs(prev_net) and (
+                    (prev_net > 0 and curr_net > 0) or (prev_net < 0 and curr_net < 0)
+                ):
+                    change_type = '減倉'
+                else:
+                    change_type = '不變'
+
+                if change_type == '不變':
+                    continue
+
+                records.append({
+                    '代號': code,
+                    '變動類型': change_type,
+                    '原方向': prev_side_str,
+                    '新方向': curr_side_str,
+                    '原張數': prev_qty_lots,
+                    '新張數': curr_qty_lots,
+                    '差異張數': diff_lots,
+                })
+
+            diff_df = pd.DataFrame(records) if records else pd.DataFrame(
+                columns=['代號', '變動類型', '原方向', '新方向', '原張數', '新張數', '差異張數']
+            )
+
+            diffs.append({
+                'date': curr_date,
+                'prev_date': prev_date,
+                'diff_df': diff_df,
+            })
+
+        return diffs
 
     # =========================================================================
     # 資料驗證
@@ -936,3 +1222,33 @@ def load_positions(xlsx_path_or_buffer) -> pd.DataFrame:
         DataFrame，包含部位資訊
     """
     return _get_loader().load_positions(xlsx_path_or_buffer)
+
+
+def load_positions_with_date(xlsx_path_or_buffer, fallback_date=None):
+    """
+    載入含日期標頭的部位 Excel
+
+    Returns:
+        (date, positions_df)
+    """
+    return _get_loader().load_positions_with_date(xlsx_path_or_buffer, fallback_date)
+
+
+def load_multi_positions(files, fallback_dates=None):
+    """
+    載入多個部位 Excel 檔，逐一解析並依日期排序
+
+    Returns:
+        List[(date, positions_df)]
+    """
+    return _get_loader().load_multi_positions(files, fallback_dates)
+
+
+def compute_position_diffs(snapshots):
+    """
+    比對相鄰快照，輸出每個日期的變動明細
+
+    Returns:
+        List[Dict]
+    """
+    return DataLoader.compute_position_diffs(snapshots)

@@ -79,20 +79,21 @@ class TestMarginRules:
         - 2317 (電子) SHORT 90,000 股 @ 100 = MV 9,000,000
         - 2330 3M 報酬 = 12.5%，2317 3M 報酬 = 0%
         - 報酬差 = 12.5% >= 10%
-        - 多方 Base IM (2330 假設 5x) = 90M / 5 = 18M
-        - 空方 Base IM (2317 假設 5x) = 9M / 5 = 1.8M
+        - 多方 Base IM (2330 股期槓桿>7 → 5x) = 90M / 5 = 18M
+        - 空方 Base IM (2317 股期槓桿>7 → 5x) = 9M / 5 = 1.8M
         - 大邊 = LONG (18M > 1.8M)
         - 小邊 = SHORT，應套用 50% 折減
         """
         data = setup_test_data
 
         # 建立分類器
-        futures_set = {'2330', '2317'}  # 都是期貨標的 → 5x
-        constituent_set = set()
+        futures_set = {'2330', '2317'}
+        futures_leverage_map = {'2330': 5.0, '2317': 5.0}  # 股期槓桿>7 → 5x
 
         classifier = InstrumentClassifier(
             futures_underlying_set=futures_set,
-            constituent_set_0050_0056=constituent_set
+            constituent_set_0050_0056=set(),
+            futures_leverage_map=futures_leverage_map
         )
 
         # ETF 處理器（空，因為沒有 ETF）
@@ -181,7 +182,8 @@ class TestMarginRules:
         # 建立分類器
         classifier = InstrumentClassifier(
             futures_underlying_set={'2330', '2317'},
-            constituent_set_0050_0056=set()
+            constituent_set_0050_0056=set(),
+            futures_leverage_map={'2330': 5.0, '2317': 5.0}
         )
 
         etf_lookthrough = ETFLookthrough({}, classifier)
@@ -246,38 +248,60 @@ class TestMarginRules:
         測試：槓桿倍數分類正確
 
         規則：
-        - 股票期貨標的：5x
-        - 0050/0056 成份股：4x
-        - 其他股票：3x
-        - 0050/0056 ETF：7x
+        - ETF → 月均量 ≥ 10,000 張 → 7x，否則 5x
+        - 股期標的 → 依股期槓桿動態判定 (5x/4x/3x)
+        - 其他股票 → 3x
         """
-        futures_set = {'2330'}
-        constituent_set = {'2317', '2454'}
+        futures_leverage_map = {
+            '2330': 5.0,  # 股期槓桿 > 7 → 5x
+            '2317': 4.0,  # 股期槓桿 > 6 且 ≤ 7 → 4x
+            '2382': 3.0,  # 股期槓桿 ≤ 6 → 3x
+        }
+
+        etf_volume_map = {
+            '0050': 97919,  # 月均量 ~97,919 張 → 7x
+            '0056': 54581,  # 月均量 ~54,581 張 → 7x
+            '00878': 3000,  # 月均量 3,000 張 → 5x
+        }
 
         classifier = InstrumentClassifier(
-            futures_underlying_set=futures_set,
-            constituent_set_0050_0056=constituent_set
+            futures_underlying_set=set(futures_leverage_map.keys()),
+            constituent_set_0050_0056=set(),
+            futures_leverage_map=futures_leverage_map,
+            etf_volume_map=etf_volume_map
         )
 
-        # 測試股票期貨標的 → 5x
+        # 測試股期標的（股期槓桿 > 7）→ 5x
         lev_2330 = classifier.classify_leverage('2330', 'STK')
         assert lev_2330.leverage == 5.0, f"2330 應為 5x，實際為 {lev_2330.leverage}"
 
-        # 測試 0050/0056 成份股 → 4x
+        # 測試股期標的（股期槓桿 > 6 且 ≤ 7）→ 4x
         lev_2317 = classifier.classify_leverage('2317', 'STK')
         assert lev_2317.leverage == 4.0, f"2317 應為 4x，實際為 {lev_2317.leverage}"
 
-        # 測試其他股票 → 3x
+        # 測試股期標的（股期槓桿 ≤ 6）→ 3x
+        lev_2382 = classifier.classify_leverage('2382', 'STK')
+        assert lev_2382.leverage == 3.0, f"2382 應為 3x，實際為 {lev_2382.leverage}"
+
+        # 測試其他股票（非股期標的）→ 3x
         lev_other = classifier.classify_leverage('9999', 'STK')
         assert lev_other.leverage == 3.0, f"其他股票應為 3x，實際為 {lev_other.leverage}"
 
-        # 測試 0050 ETF → 7x
+        # 測試 0050 ETF（月均量 ≥ 10,000 張）→ 7x
         lev_0050 = classifier.classify_leverage('0050', 'ETF')
-        assert lev_0050.leverage == 7.0, f"0050 應為 7x，實際為 {lev_0050.leverage}"
+        assert lev_0050.leverage == 7.0, f"0050 月均量高應為 7x，實際為 {lev_0050.leverage}"
 
-        # 測試 0056 ETF → 7x
+        # 測試 0056 ETF（月均量 ≥ 10,000 張）→ 7x
         lev_0056 = classifier.classify_leverage('0056', 'ETF')
-        assert lev_0056.leverage == 7.0, f"0056 應為 7x，實際為 {lev_0056.leverage}"
+        assert lev_0056.leverage == 7.0, f"0056 月均量高應為 7x，實際為 {lev_0056.leverage}"
+
+        # 測試其他 ETF（月均量 < 10,000 張）→ 5x
+        lev_other_etf = classifier.classify_leverage('00878', 'ETF')
+        assert lev_other_etf.leverage == 5.0, f"00878 月均量低應為 5x，實際為 {lev_other_etf.leverage}"
+
+        # 測試無月均量資料的 ETF → 5x（保守處理）
+        lev_no_vol = classifier.classify_leverage('00929', 'ETF')
+        assert lev_no_vol.leverage == 5.0, f"無月均量資料的 ETF 應為 5x，實際為 {lev_no_vol.leverage}"
 
         print("✅ test_leverage_classification 通過")
 
