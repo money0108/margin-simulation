@@ -42,10 +42,24 @@ def download_from_google_drive(file_id: str, destination: str, is_sheet: bool = 
             # Google Sheets 用匯出連結
             URL = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
             response = requests.get(URL, stream=True, timeout=120)
+            if response.status_code != 200:
+                print(f"Google Sheets 下載失敗，HTTP {response.status_code}")
+                return False
             with open(destination, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=32768):
                     if chunk:
                         f.write(chunk)
+            # 驗證下載的 xlsx 是否有效（不是 HTML 錯誤頁面）
+            try:
+                with open(destination, 'rb') as f:
+                    header = f.read(4)
+                # 有效的 xlsx (ZIP) 檔案以 PK\x03\x04 開頭
+                if header[:2] != b'PK':
+                    print(f"下載的檔案不是有效的 xlsx（可能為 HTML 錯誤頁面）")
+                    Path(destination).unlink(missing_ok=True)
+                    return False
+            except Exception:
+                pass
             return True
         else:
             # Google Drive 大文件使用 gdown
@@ -463,13 +477,22 @@ class DataLoader:
                 rename_map[orig_name] = std_name
         df = df.rename(columns=rename_map)
 
-        # 確保 code 欄位存在
+        # 確保 code 欄位存在（多重 fallback）
         if 'code' not in df.columns:
             # 嘗試尋找代號欄位
             for col in df.columns:
-                if '代號' in col:
+                if '代號' in str(col):
                     df = df.rename(columns={col: 'code'})
                     break
+
+        # 若仍找不到，嘗試第一欄（通常為股票代號）
+        if 'code' not in df.columns and len(df.columns) > 0:
+            first_col = df.columns[0]
+            print(f"[load_industry] 找不到 code 欄位，使用第一欄 '{first_col}' 作為 code。實際欄位: {list(df.columns)}")
+            df = df.rename(columns={first_col: 'code'})
+
+        if 'code' not in df.columns:
+            raise KeyError(f"產業分類檔案缺少 code 欄位。實際欄位: {list(df.columns)}")
 
         df['code'] = df['code'].astype(str).str.strip()
 
