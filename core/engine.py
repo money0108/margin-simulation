@@ -257,6 +257,9 @@ class BacktestEngine:
         # 確保日期為 Timestamp
         schedule = [(pd.Timestamp(d), df) for d, df in schedule]
 
+        # 淨額化：同一代碼有 LONG + SHORT 時互抵，避免幻影部位
+        schedule = [(d, self._net_positions(df)) for d, df in schedule]
+
         if start_date is None:
             start_date = schedule[0][0]
         else:
@@ -277,8 +280,8 @@ class BacktestEngine:
         # schedule_dates[i] 為第 i 個快照的生效日
         schedule_dates = [s[0] for s in schedule]
 
-        # 當前使用的部位（初始為第一個快照）
-        current_positions = schedule[0][1]
+        # 當前使用的部位（初始為第一個快照，確保淨額化）
+        current_positions = self._net_positions(schedule[0][1])
         next_schedule_idx = 1  # 下一個要切換的快照索引
 
         # 初始化結果
@@ -324,7 +327,7 @@ class BacktestEngine:
                 next_date = schedule_dates[next_schedule_idx]
                 if date >= next_date:
                     is_position_change = True
-                    new_positions_df = schedule[next_schedule_idx][1]
+                    new_positions_df = self._net_positions(schedule[next_schedule_idx][1])
                     position_change_dates.add(date)
                     next_schedule_idx += 1
 
@@ -368,8 +371,42 @@ class BacktestEngine:
                     base_prices, prices_today
                 )
 
-                # --- 3. 切換到新部位，算新 IM ---
+                # --- 3. 切換到新部位，先算 IM（用於決定入金金額）---
                 current_positions = new_positions_df
+                try:
+                    pre_margin = self.margin_calculator.calculate(
+                        positions=current_positions,
+                        prices_today=prices_today,
+                        asof_date=date,
+                        equity=current_equity,
+                        build_reports=False
+                    )
+                except Exception as e:
+                    print(f"日期 {date} 新部位計算失敗: {e}")
+                    continue
+
+                if pre_margin.im_today <= 0:
+                    continue
+
+                new_im = pre_margin.im_today
+
+                # --- 4. 出金：浮盈不可出金，僅限實現損益與釋放保證金 ---
+                withdrawal = 0.0
+                cash_base = initial_deposit + realized_pnl  # 現金基底（不含浮動損益）
+                cash_excess = cash_base - new_im
+                equity_excess = current_equity - new_im
+                if cash_excess > 0 and equity_excess > 0:
+                    withdrawal = min(cash_excess, equity_excess)
+                current_equity -= withdrawal
+
+                position_change_withdrawals[date] = withdrawal
+
+                # --- 5. 加減倉入金：補足至新 IM ---
+                equity_at_change = current_equity  # 出金後、入金前
+                pos_change_deposit = max(0, new_im - current_equity)
+                current_equity += pos_change_deposit
+
+                # --- 6. 以入金後 equity 重算完整報表（含對沖折抵明細）---
                 try:
                     margin_result = self.margin_calculator.calculate(
                         positions=current_positions,
@@ -378,24 +415,12 @@ class BacktestEngine:
                         equity=current_equity
                     )
                 except Exception as e:
-                    print(f"日期 {date} 新部位計算失敗: {e}")
-                    continue
-
-                if margin_result.im_today <= 0:
+                    print(f"日期 {date} 新部位報表計算失敗: {e}")
                     continue
 
                 current_net_mv = margin_result.long_mv - margin_result.short_mv
 
-                # --- 4. 出金：僅就實現損益可出金，且不低於新 IM ---
-                withdrawal = 0.0
-                if realized_pnl > 0:
-                    excess = max(0, current_equity - margin_result.im_today)
-                    withdrawal = min(realized_pnl, excess)
-                    current_equity -= withdrawal
-
-                position_change_withdrawals[date] = withdrawal
-
-                # --- 5. 重設基準 ---
+                # --- 7. 重設基準 ---
                 initial_deposit = current_equity
                 base_net_mv = current_net_mv
                 base_prices = prices_today.copy()
@@ -420,11 +445,12 @@ class BacktestEngine:
                     'date': date,
                     'new_im': margin_result.im_today,
                     'new_mm': fixed_mm,
-                    'equity_at_change': current_equity,
+                    'equity_at_change': equity_at_change,
                     'long_mv': margin_result.long_mv,
                     'short_mv': margin_result.short_mv,
                     'realized_pnl': realized_pnl,
                     'withdrawal': withdrawal,
+                    'cash_base': cash_base,  # 現金基底（不含浮動損益）
                     # --- 變動前狀態 ---
                     'old_im': old_margin.im_today,
                     'old_mm': old_fixed_mm,
@@ -439,41 +465,7 @@ class BacktestEngine:
                     'realized_pnl_details': realized_pnl_details,
                 })
 
-                # --- 6. 若 equity < MM → 立即追繳 ---
-                if current_equity < fixed_mm:
-                    required_deposit = max(0, margin_result.im_today - current_equity)
-                    equity_before_call = current_equity
-                    mm_at_call = fixed_mm
-
-                    initial_deposit = margin_result.im_today
-                    fixed_mm = margin_result.im_today * 0.70
-                    base_net_mv = current_net_mv
-                    base_prices = prices_today.copy()
-                    current_equity = initial_deposit
-
-                    # 追繳後重置融資
-                    long_financing = max(0, margin_result.long_mv - current_equity)
-                    short_financing = margin_result.short_mv
-
-                    margin_result.equity = current_equity
-                    margin_result.equity_before_call = equity_before_call
-                    margin_result.mm_today = fixed_mm
-                    margin_result.mm_at_call = mm_at_call
-                    margin_result.margin_call = True
-                    margin_result.required_deposit = required_deposit
-
-                    daily_results.append(DailyResult(date=date, margin_result=margin_result))
-                    margin_call_events.append({
-                        'date': date,
-                        'im_today': margin_result.im_today,
-                        'mm_today': margin_result.mm_today,
-                        'equity': margin_result.equity,
-                        'required_deposit': margin_result.required_deposit,
-                        'status': 'TRIGGERED (部位變動)'
-                    })
-                    continue
-
-                # 正常（無追繳）
+                # 加減倉入金後 equity >= IM > MM，無需追繳判定
                 margin_result.equity = current_equity
                 margin_result.equity_before_call = current_equity
                 margin_result.mm_today = fixed_mm
@@ -634,6 +626,44 @@ class BacktestEngine:
         )
 
     @staticmethod
+    def _net_positions(df: pd.DataFrame) -> pd.DataFrame:
+        """同一代碼有 LONG + SHORT 時互抵，保留淨部位。
+
+        例：LONG 2303 1000 + SHORT 2303 2000 → SHORT 2303 1000
+        避免幻影雙邊部位造成 MV / IM 虛增。
+        """
+        if df is None or len(df) == 0:
+            return df
+
+        rows = []
+        # 先按 (code, side) 合計數量
+        agg = df.groupby(['code', 'side'], as_index=False)['qty'].sum()
+        # 保留 instrument 資訊（取第一筆）
+        inst_map = df.drop_duplicates('code').set_index('code')['instrument'].to_dict()
+
+        for code in agg['code'].unique():
+            code_rows = agg[agg['code'] == code]
+            long_qty = float(code_rows.loc[code_rows['side'] == 'LONG', 'qty'].sum())
+            short_qty = float(code_rows.loc[code_rows['side'] == 'SHORT', 'qty'].sum())
+            net = long_qty - short_qty
+            instrument = inst_map.get(code, 'STK')
+            if net > 0:
+                rows.append({'code': code, 'side': 'LONG', 'qty': net, 'instrument': instrument})
+            elif net < 0:
+                rows.append({'code': code, 'side': 'SHORT', 'qty': -net, 'instrument': instrument})
+            # net == 0 → 部位完全對沖，不列入
+
+        if not rows:
+            return pd.DataFrame(columns=['code', 'side', 'qty', 'instrument'])
+        result = pd.DataFrame(rows)
+        # 保留原 df 可能有的額外欄位（如 leverage_override 等），取第一筆
+        extra_cols = [c for c in df.columns if c not in ('code', 'side', 'qty', 'instrument')]
+        if extra_cols:
+            extra_map = df.drop_duplicates('code').set_index('code')[extra_cols]
+            result = result.join(extra_map, on='code', how='left')
+        return result
+
+    @staticmethod
     def _compute_realized_pnl(prev_positions: pd.DataFrame,
                                new_positions: pd.DataFrame,
                                base_prices: Dict[str, float],
@@ -662,6 +692,8 @@ class BacktestEngine:
 
         realized_pnl = 0.0
         details: List[Dict] = []
+
+        # --- Pass 1: 同方向數量減少（減倉 / 平倉） ---
         for (code, side), old_qty in old_map.items():
             bp = base_prices.get(code, 0)
             cp = current_prices.get(code, 0)
@@ -692,6 +724,66 @@ class BacktestEngine:
                 'current_price': cp,
                 'pnl': pnl,
             })
+
+        # --- Pass 2: 反向部位新增（反向平倉） ---
+        # 例：原持有 LONG 100張，新增 SHORT 10張 → 視同平倉 10張 LONG
+        # 注意：若已有雙邊部位（如 LONG 1000 + SHORT 2000），
+        #       min(old_long, old_short) 已互相對沖，只有「未對沖部分」可被新增反向單沖銷
+        seen_codes = set()
+        for (code, _) in list(old_map.keys()) + list(new_map.keys()):
+            seen_codes.add(code)
+
+        for code in seen_codes:
+            bp = base_prices.get(code, 0)
+            cp = current_prices.get(code, 0)
+            if bp == 0 or cp == 0:
+                continue
+
+            old_long = old_map.get((code, 'LONG'), 0)
+            old_short = old_map.get((code, 'SHORT'), 0)
+            new_long = new_map.get((code, 'LONG'), 0)
+            new_short = new_map.get((code, 'SHORT'), 0)
+
+            # 已對沖量 = 雙邊部位中較小者
+            already_offset = min(old_long, old_short)
+
+            # 新增空單 → 對沖既有多單（僅未對沖部分可沖）
+            added_short = max(0, new_short - old_short)
+            unmatched_long = old_long - already_offset
+            if added_short > 0 and unmatched_long > 0:
+                offset_qty = min(added_short, unmatched_long)
+                pnl = (cp - bp) * offset_qty
+                realized_pnl += pnl
+                details.append({
+                    'code': code,
+                    'side': 'LONG',
+                    'change_type': '反向平倉',
+                    'old_qty': unmatched_long,
+                    'new_qty': unmatched_long - offset_qty,
+                    'closed_qty': offset_qty,
+                    'base_price': bp,
+                    'current_price': cp,
+                    'pnl': pnl,
+                })
+
+            # 新增多單 → 對沖既有空單（僅未對沖部分可沖）
+            added_long = max(0, new_long - old_long)
+            unmatched_short = old_short - already_offset
+            if added_long > 0 and unmatched_short > 0:
+                offset_qty = min(added_long, unmatched_short)
+                pnl = (bp - cp) * offset_qty
+                realized_pnl += pnl
+                details.append({
+                    'code': code,
+                    'side': 'SHORT',
+                    'change_type': '反向平倉',
+                    'old_qty': unmatched_short,
+                    'new_qty': unmatched_short - offset_qty,
+                    'closed_qty': offset_qty,
+                    'base_price': bp,
+                    'current_price': cp,
+                    'pnl': pnl,
+                })
 
         return realized_pnl, details
 
@@ -870,7 +962,7 @@ class BacktestEngine:
                 "12. 加倉/平倉處理：部位變動時權益延續、MM 重置為新 IM×70%、P&L 基準重設"
             )
             assumptions.append(
-                "13. 出金規則：部位變動時，僅就變動部位的實現損益可出金（不得低於新 IM），出金後融資金額相應增加"
+                "13. 出金規則：浮動損益不可出金；僅實現損益與釋放保證金可出金（浮盈可抵加倉保證金），出金後融資金額相應增加"
             )
 
         if missing_codes:

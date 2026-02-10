@@ -440,7 +440,7 @@ class MarginCalculator:
             same_bucket_rate = 0.0
             if mv_long_b > 0 and mv_short_b > 0:
                 if r_big is not None and r_small is not None:
-                    r_diff = r_big - r_small
+                    r_diff = abs(r_big - r_small)
                     same_bucket_rate = 0.50 if r_diff >= 0.10 else 0.20
                 else:
                     same_bucket_rate = 0.20
@@ -767,8 +767,12 @@ class MarginCalculator:
         """
         建立多空配對明細表
 
-        顯示每個標的的多空配對狀況與減收明細
+        保留 code-level 多空配對視角，同時從 atoms_df 取得實際折減值。
+        同桶/跨桶折減在產業桶層級運作，即使不同代碼也可對沖。
         """
+        if atoms_df.empty:
+            return pd.DataFrame()
+
         # 按標的代碼彙總多空 MV
         long_by_code = atoms_df[atoms_df['side'] == 'LONG'].groupby('code').agg({
             'mv': 'sum',
@@ -785,75 +789,91 @@ class MarginCalculator:
         }).rename(columns={'mv': 'short_mv', 'base_im': 'short_base_im'})
 
         # 合併多空
-        pairing = long_by_code.join(short_by_code, how='outer', lsuffix='_l', rsuffix='_s').fillna(0)
+        pairing = long_by_code.join(short_by_code, how='outer', lsuffix='_l', rsuffix='_s')
 
-        # 整理欄位
+        # 數值欄填 0，非數值保留 NaN 再用 combine_first
+        for c in ['long_mv', 'long_base_im', 'short_mv', 'short_base_im']:
+            if c in pairing.columns:
+                pairing[c] = pairing[c].fillna(0)
         pairing['bucket'] = pairing['bucket_l'].combine_first(pairing['bucket_s'])
-        pairing['is_from_etf'] = pairing['is_from_etf_l'] | pairing['is_from_etf_s']
-
-        # 清理
+        pairing['is_from_etf'] = pairing['is_from_etf_l'].fillna(False) | pairing['is_from_etf_s'].fillna(False)
         pairing = pairing.drop(columns=['bucket_l', 'bucket_s', 'is_from_etf_l', 'is_from_etf_s'], errors='ignore')
 
         # 計算配對金額
         pairing['hedged_mv'] = pairing[['long_mv', 'short_mv']].min(axis=1)
 
-        # 判斷減收類型與金額
+        # 每檔槓桿（同代碼不分邊，取 first）
+        code_leverage = atoms_df.groupby('code')['leverage'].first()
+        pairing = pairing.join(code_leverage, how='left')
+
+        # 從 atoms_df 取得小邊的實際折減值（桶層級已計算好）
+        small_disc = atoms_df[atoms_df['side'] == small_side].groupby('code').agg({
+            'disc100_im': 'sum',
+            'disc_same_im': 'sum',
+            'disc_cross_im': 'sum',
+            'total_disc_im': 'sum',
+        })
+        pairing = pairing.join(small_disc, how='left').fillna(0)
+
         records = []
         for code, row in pairing.iterrows():
             long_mv = row.get('long_mv', 0)
             short_mv = row.get('short_mv', 0)
             hedged_mv = row.get('hedged_mv', 0)
             bucket = row.get('bucket', '非金電')
-            is_from_etf = row.get('is_from_etf', False)
+            leverage = row.get('leverage', 0)
+            long_base_im = row.get('long_base_im', 0)
+            short_base_im = row.get('short_base_im', 0)
+            base_im = long_base_im + short_base_im
 
-            # 判斷小邊 MV
-            if small_side == 'LONG':
-                small_mv = long_mv
-                small_base_im = row.get('long_base_im', 0)
-            else:
-                small_mv = short_mv
-                small_base_im = row.get('short_base_im', 0)
+            # 從 atoms_df 取得的實際折減值
+            disc100 = row.get('disc100_im', 0)
+            disc_same = row.get('disc_same_im', 0)
+            disc_cross = row.get('disc_cross_im', 0)
+            total_disc = row.get('total_disc_im', 0)
+            net_im = base_im - total_disc
 
-            # 減收類型判定
-            reduction_type = ''
-            reduction_rate = 0.0
-            reduction_im = 0.0
-
-            if hedged_mv > 0:
-                if is_from_etf:
-                    # ETF 完全對沖
-                    reduction_type = 'ETF完全對沖'
-                    reduction_rate = 1.0
-                    reduction_im = small_base_im * min(1.0, hedged_mv / small_mv) if small_mv > 0 else 0
+            # 減收類型：依實際折減值判定（含比率與詳細資訊）
+            parts = []
+            if disc100 > 0:
+                parts.append('ETF完全對沖(100%)')
+            if disc_same > 0:
+                bucket_enum = (Bucket.ELECT if bucket == '電子'
+                               else (Bucket.FIN if bucket == '金融'
+                                     else Bucket.NON))
+                rate_result = reduction_rates.get(bucket_enum)
+                if rate_result:
+                    base_rate = rate_result.same_bucket_rate
+                    r_diff_str = f'{rate_result.r_diff:.1%}' if rate_result.r_diff is not None else 'N/A'
+                    ratio_str = f'{rate_result.eligible_hedged_ratio:.0%}'
+                    parts.append(f'同桶對沖({base_rate:.0%}|報酬差{r_diff_str}|可沖比{ratio_str})')
                 else:
-                    # 同桶對沖
-                    bucket_enum = Bucket.ELECT if bucket == '電子' else (Bucket.FIN if bucket == '金融' else Bucket.NON)
-                    rate_result = reduction_rates.get(bucket_enum)
-                    if rate_result and rate_result.same_bucket_rate > 0:
-                        reduction_type = '同桶對沖'
-                        reduction_rate = rate_result.same_bucket_rate
-                        hedge_ratio = min(1.0, hedged_mv / small_mv) if small_mv > 0 else 0
-                        reduction_im = small_base_im * reduction_rate * hedge_ratio
+                    parts.append('同桶對沖')
+            if disc_cross > 0:
+                parts.append('跨桶對沖(20%)')
 
             records.append({
                 '代碼': code,
                 '產業桶': bucket,
+                '槓桿': round(leverage, 2),
                 '多方MV': round(long_mv),
                 '空方MV': round(short_mv),
                 '配對MV': round(hedged_mv),
-                '來源': 'ETF拆解' if is_from_etf else '直接持有',
-                '減收類型': reduction_type if reduction_type else '無配對',
-                '減收率': f'{reduction_rate:.0%}' if reduction_rate > 0 else '-',
-                '減收IM': round(reduction_im),
+                'Base_IM': round(base_im),
+                'ETF折減': round(disc100),
+                '同桶折減': round(disc_same),
+                '跨桶折減': round(disc_cross),
+                '總折減': round(total_disc),
+                '淨IM': round(net_im),
+                '減收類型': ' + '.join(parts) if parts else '—',
             })
 
         result_df = pd.DataFrame(records)
 
-        # 只顯示有配對或有曝險的標的
-        result_df = result_df[(result_df['多方MV'] > 0) | (result_df['空方MV'] > 0)]
-
-        # 按減收金額排序
-        result_df = result_df.sort_values('減收IM', ascending=False)
+        # 只顯示有曝險的標的
+        if not result_df.empty:
+            result_df = result_df[(result_df['多方MV'] > 0) | (result_df['空方MV'] > 0)]
+            result_df = result_df.sort_values('總折減', ascending=False)
 
         return result_df
 

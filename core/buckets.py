@@ -440,7 +440,7 @@ class BucketAnalyzer:
             # 制度條款 4.3：同桶折減率判定
             if m.mv_long > 0 and m.mv_short > 0:
                 if r_big is not None and r_small is not None:
-                    result.r_diff = r_big - r_small
+                    result.r_diff = abs(r_big - r_small)
 
                     # 制度條款 4.3：若 R_big - R_small >= 10% → 50%
                     if result.r_diff >= 0.10:
